@@ -3285,7 +3285,9 @@ pub fn transform_for_browser_sync(
     filename: String,
     options: Option<BrowserTransformOptions>,
 ) -> BrowserTransformResult {
-    use oxc_angular_compiler::browser::{BrowserTransformOptions as RustOptions, transform_for_browser};
+    use oxc_angular_compiler::browser::{
+        BrowserTransformOptions as RustOptions, transform_for_browser,
+    };
 
     let options = options.unwrap_or_default();
     let allocator = Allocator::default();

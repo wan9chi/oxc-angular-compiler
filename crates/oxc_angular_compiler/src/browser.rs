@@ -10,8 +10,9 @@ use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{
-    ClassPropertiesOptions, CompilerAssumptions, DecoratorOptions, ES2017Options, ES2018Options, ES2022Options,
-    EnvOptions, HelperLoaderMode, HelperLoaderOptions, TransformOptions, Transformer, TypeScriptOptions,
+    ClassPropertiesOptions, CompilerAssumptions, DecoratorOptions, ES2017Options, ES2018Options,
+    ES2022Options, EnvOptions, HelperLoaderMode, HelperLoaderOptions, TransformOptions,
+    Transformer, TypeScriptOptions,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -54,18 +55,28 @@ pub fn transform_for_browser(
         env.es2018 = ES2018Options { async_generator_functions: true, ..env.es2018 };
     }
     if typescript {
-        env.es2022 = ES2022Options { class_properties: Some(ClassPropertiesOptions { loose: true }), ..env.es2022 };
+        env.es2022 = ES2022Options {
+            class_properties: Some(ClassPropertiesOptions { loose: true }),
+            ..env.es2022
+        };
     }
     let transform_options = TransformOptions {
         cwd: PathBuf::new(),
-        typescript: TypeScriptOptions { remove_class_fields_without_initializer: true, ..Default::default() },
+        typescript: TypeScriptOptions {
+            remove_class_fields_without_initializer: true,
+            ..Default::default()
+        },
         assumptions: CompilerAssumptions { set_public_class_fields: true, ..Default::default() },
         decorator: DecoratorOptions { legacy: typescript, ..Default::default() },
         env,
-        helper_loader: HelperLoaderOptions { mode: HelperLoaderMode::Runtime, ..Default::default() },
+        helper_loader: HelperLoaderOptions {
+            mode: HelperLoaderMode::Runtime,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let scoping = SemanticBuilder::new().with_excess_capacity(2.0).build(&program).semantic.into_scoping();
+    let scoping =
+        SemanticBuilder::new().with_excess_capacity(2.0).build(&program).semantic.into_scoping();
     let transformed = Transformer::new(allocator, Path::new(filename), &transform_options)
         .build_with_scoping(scoping, &mut program);
     if transformed.diagnostics.has_errors() {
@@ -107,7 +118,10 @@ mod tests {
 
     #[test]
     fn lowers_async_and_for_await() {
-        let out = run("export async function f(xs) { for await (const x of xs) await x; }\nexport async function* g() { yield 1; }", "a.mjs");
+        let out = run(
+            "export async function f(xs) { for await (const x of xs) await x; }\nexport async function* g() { yield 1; }",
+            "a.mjs",
+        );
         assert!(!out.contains("async function"), "{out}");
         assert!(!out.contains("for await"), "{out}");
         assert!(out.contains("@oxc-project/runtime/helpers/asyncToGenerator"), "{out}");
