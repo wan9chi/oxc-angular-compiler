@@ -31,6 +31,7 @@ import {
   type AngularVersion,
 } from '#binding'
 
+import { asyncLoweringPlugin } from './angular-async-lowering-plugin.js'
 import { buildOptimizerPlugin } from './angular-build-optimizer-plugin.js'
 import { jitPlugin } from './angular-jit-plugin.js'
 import { angularLinkerPlugin } from './angular-linker-plugin.js'
@@ -59,7 +60,17 @@ export interface PluginOptions {
   /** Enable source map generation. */
   sourceMap?: boolean | { scripts?: boolean; vendor?: boolean }
 
-  /** Enable zoneless mode. */
+  /**
+   * Whether the app runs without zone.js.
+   *
+   * Unless it is zoneless, `async`/`await`, async generators and `for await` in
+   * application code are lowered to generators, as the Angular CLI does, so
+   * zone.js can track them (`fakeAsync`/`tick()`, change detection after an
+   * `await`). Server (SSR) transforms keep them native.
+   *
+   * Default: zoneless unless `zone.js` is installed in a `node_modules` above the
+   * Vite root.
+   */
   zoneless?: boolean
 
   /**
@@ -285,10 +296,13 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       typeof options.sourceMap === 'boolean'
         ? options.sourceMap
         : (options.sourceMap?.scripts ?? true),
+<<<<<<< 04cb3b2c33f94f74ab4654534bf09f03dc5eca99
     // Like Angular CLI's `normalizeSourceMaps`, vendor maps are off unless the
     // object form turns them on; `sourceMap: true` only covers scripts.
     vendorSourceMap: typeof options.sourceMap === 'object' && (options.sourceMap.vendor ?? false),
     zoneless: options.zoneless ?? false,
+=======
+>>>>>>> a59e630c1ae9f3d9c537da694413ca4d6e46799f
     fileReplacements,
     angularVersion: options.angularVersion,
     emitClassMetadata: options.emitClassMetadata ?? true,
@@ -1662,6 +1676,10 @@ export function angular(options: PluginOptions = {}): Plugin[] {
     }),
     ssrManifestPlugin({
       ssrEntry: options.ssrEntry,
+    }),
+    asyncLoweringPlugin({
+      zoneless: options.zoneless,
+      sourcemap: pluginOptions.sourceMap,
     }),
   ].filter(Boolean) as Plugin[]
 }
