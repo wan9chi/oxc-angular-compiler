@@ -223,6 +223,59 @@ export class Parent {}
     assert_lazy(&result.code, "./lazy", "default");
 }
 
+/// Port of ngtsc's `defer_spec.ts`: "should lazy-load dependency referenced
+/// with a fowrardRef".
+#[test]
+fn forward_ref_import_used_only_inside_defer_is_lazy_loaded() {
+    for entry in ["forwardRef(() => LazyCmp)", "forwardRef(() => { return LazyCmp; })"] {
+        let dir = TempDir::new().unwrap();
+        lazy_cmp(&dir);
+        let result = transform(
+            &dir,
+            &format!(
+                r#"
+import {{ Component, forwardRef }} from '@angular/core';
+import {{ LazyCmp }} from './lazy';
+
+@Component({{
+    selector: 'app-parent',
+    imports: [{entry}],
+    template: '@defer {{ <app-lazy/> }}',
+}})
+export class Parent {{}}
+"#
+            ),
+        );
+        let code = &result.code;
+        assert_lazy(code, "./lazy", "LazyCmp");
+        assert!(compact(code).contains("ɵɵdefer(1,0,()=>[import(\"./lazy\")"), "{code}");
+        assert!(compact(code).contains("ɵɵgetComponentDepsFactory(Parent,[])"), "{code}");
+        assert!(!code.contains("import { LazyCmp }"), "{code}");
+    }
+}
+
+#[test]
+fn forward_ref_not_from_angular_core_stays_eager() {
+    let dir = TempDir::new().unwrap();
+    lazy_cmp(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { forwardRef } from './my-forward-ref';
+import { LazyCmp } from './lazy';
+
+@Component({
+    selector: 'app-parent',
+    imports: [forwardRef(() => LazyCmp)],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {}
+"#,
+    );
+    assert_eager(&result.code, "./lazy");
+}
+
 #[test]
 fn import_referenced_elsewhere_in_the_file_stays_eager() {
     let dir = TempDir::new().unwrap();

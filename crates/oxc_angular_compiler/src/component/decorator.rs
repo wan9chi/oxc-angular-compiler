@@ -20,6 +20,7 @@ use super::transform::ImportMap;
 use crate::directive::{
     HostKey, MemberHostBindings, StringConsts, evaluate_host_directives, extract_input_metadata_in,
     extract_output_metadata_in, merge_by_class_property, merge_host_bindings, parse_decorator_io,
+    try_unwrap_forward_ref,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::util::is_metadata_property;
@@ -178,6 +179,8 @@ pub fn extract_component_metadata<'a>(
                     // For standalone components, we need:
                     // 1. The identifier list for local analysis
                     metadata.imports = extract_identifier_array(allocator, &prop.value);
+                    metadata.forward_ref_imports =
+                        extract_forward_ref_array(allocator, &prop.value, consts);
                     // 2. The raw expression to pass to ɵɵgetComponentDepsFactory in RuntimeResolved mode
                     metadata.raw_imports =
                         convert_oxc_expression(allocator, &prop.value, source_text);
@@ -484,6 +487,25 @@ fn extract_identifier_array<'a>(
         }
     }
 
+    result
+}
+
+/// The classes an array literal names as `forwardRef(() => X)`, with
+/// `@angular/core`'s `forwardRef`.
+fn extract_forward_ref_array<'a>(
+    allocator: &'a Allocator,
+    expr: &'a Expression<'a>,
+    consts: &StringConsts<'_>,
+) -> Vec<'a, Ident<'a>> {
+    let mut result = Vec::new_in(&allocator);
+    if let Expression::ArrayExpression(arr) = expr {
+        for element in arr.elements.iter().filter_map(ArrayExpressionElement::as_expression) {
+            if let Some(Expression::Identifier(id)) = try_unwrap_forward_ref(element, Some(consts))
+            {
+                result.push(id.name);
+            }
+        }
+    }
     result
 }
 

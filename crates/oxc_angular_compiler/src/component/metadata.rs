@@ -428,6 +428,12 @@ pub struct ComponentMetadata<'a> {
     /// Component imports (for standalone components).
     pub imports: Vec<'a, Ident<'a>>,
 
+    /// The classes written as `forwardRef(() => X)` (`@angular/core`'s) in
+    /// the `imports` array literal, which [`Self::imports`] leaves out. Only
+    /// read to let `@defer` lazy-load them, as ngtsc resolves them through
+    /// its `forwardRefResolver`.
+    pub forward_ref_imports: Vec<'a, Ident<'a>>,
+
     /// Exported names for template references.
     ///
     /// In Angular, `exportAs` can be a comma-separated string (e.g., "foo, bar"),
@@ -852,6 +858,7 @@ impl<'a> ComponentMetadata<'a> {
             change_detection: None,
             host: None,
             imports: Vec::new_in(&allocator),
+            forward_ref_imports: Vec::new_in(&allocator),
             export_as: Vec::new_in(&allocator),
             preserve_whitespaces: false,
             constructor_deps: None,
