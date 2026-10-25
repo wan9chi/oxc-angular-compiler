@@ -296,13 +296,9 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       typeof options.sourceMap === 'boolean'
         ? options.sourceMap
         : (options.sourceMap?.scripts ?? true),
-<<<<<<< 04cb3b2c33f94f74ab4654534bf09f03dc5eca99
     // Like Angular CLI's `normalizeSourceMaps`, vendor maps are off unless the
     // object form turns them on; `sourceMap: true` only covers scripts.
     vendorSourceMap: typeof options.sourceMap === 'object' && (options.sourceMap.vendor ?? false),
-    zoneless: options.zoneless ?? false,
-=======
->>>>>>> a59e630c1ae9f3d9c537da694413ca4d6e46799f
     fileReplacements,
     angularVersion: options.angularVersion,
     emitClassMetadata: options.emitClassMetadata ?? true,
