@@ -326,13 +326,7 @@ impl<'a> ImportElisionAnalyzer<'a> {
             return;
         }
         let type_params = crate::class_metadata::type_param_names_of(class);
-        for element in &class.body.body {
-            let ClassElement::MethodDefinition(method) = element else {
-                continue;
-            };
-            if method.kind != MethodDefinitionKind::Constructor {
-                continue;
-            }
+        if let Some(method) = crate::util::find_constructor(class) {
             for param in &method.value.params.items {
                 let Some(annotation) = &param.type_annotation else {
                     continue;
