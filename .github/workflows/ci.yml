@@ -1,5 +1,8 @@
 name: CI
 
+# Replay: CI keeps only the E2E job, whose `Compare tests` step runs `vp run compare` with remote
+# caching, and a replay check job. Runs aren't cancelled by newer pushes, so every replayed event
+# finishes.
 on:
   push:
     branches:
@@ -8,103 +11,10 @@ on:
     branches:
       - main
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    steps:
-      - name: Enable Git long paths (Windows)
-        if: ${{ matrix.os == 'windows-latest' }}
-        run: git config --global core.longpaths true
-
-      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
-
-      - name: Update submodules
-        run: git submodule update --init --recursive
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@fb003b4f771bbf9c2de31d5f65c40689cc097fb5 # v2.1.0
-
-      - name: Check
-        run: cargo check --all-features
-
-      - name: Test
-        run: cargo test --all-features
-
-      - name: Format
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: cargo fmt --all -- --check
-
-      - name: Conformance
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: |
-          cargo run -p oxc_angular_conformance
-          git diff --exit-code
-
-  napi-smoke:
-    name: NAPI Smoke (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    steps:
-      - name: Enable Git long paths (Windows)
-        if: ${{ matrix.os == 'windows-latest' }}
-        run: git config --global core.longpaths true
-
-      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
-
-      - name: Update submodules
-        run: git submodule update --init --recursive
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@fb003b4f771bbf9c2de31d5f65c40689cc097fb5 # v2.1.0
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6.0.0
-
-      - name: Install Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install
-
-      - name: Build
-        run: |
-          pnpm build-dev
-          pnpm --filter ./napi/angular-compiler build:ts
-
-      - name: Test
-        run: pnpm test
-
   napi:
     name: NAPI Build (Ubuntu E2E)
     runs-on: ubuntu-latest
-    needs: napi-smoke
     permissions:
       contents: read
       # Remote cache uploads authenticate with a GitHub Actions OIDC token.
@@ -112,8 +22,9 @@ jobs:
     env:
       # Remote task cache, on when the repository variable is set. Pushes and pull requests from
       # this repository upload results; fork pull requests get no OIDC token and only download.
+      # Replay: pull requests from fork/ branches stand in for fork pull requests.
       VP_REMOTE_CACHE_URL: ${{ vars.VP_REMOTE_CACHE_URL }}
-      VP_REMOTE_CACHE: ${{ !vars.VP_REMOTE_CACHE_URL && 'off' || (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'read-write' || 'read' }}
+      VP_REMOTE_CACHE: ${{ !vars.VP_REMOTE_CACHE_URL && 'off' || (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository && !startsWith(github.head_ref, 'fork/')) && 'read-write' || 'read' }}
     steps:
       - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
 
@@ -154,3 +65,69 @@ jobs:
       # baseline, then the comparison with Oxc (see vite.config.ts).
       - name: Compare tests
         run: pnpm exec vp run compare
+        env:
+          # Replay diagnostics: vp's debug traces show where each task's time goes, such as how long
+          # its remote cache lookup waited. VP_* envs aren't fingerprinted.
+          VP_LOG: vt=debug,vt_remote_cache=debug
+      # Replay diagnostics: the full summary of the compare run, with each task's cache status.
+      - if: ${{ !cancelled() }}
+        run: pnpm exec vp run --last-details
+      # Replay check: hand the baseline the cached run left to the check job below.
+      - if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ng-baseline
+          path: napi/angular-compiler/e2e/compare/ng-baseline-fixtures.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Replay check, off the E2E job's critical path: generate the baseline again without the cache and
+  # compare it with the one the cached run left. A difference after a hit is a false hit unless
+  # ngtsc's output is nondeterministic. The generation script never loads the Oxc binding, so this
+  # job doesn't build it.
+  baseline-check:
+    name: Replay check (baseline)
+    needs: napi
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VP_REMOTE_CACHE: 'off'
+    steps:
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6.0.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ng-baseline
+          path: ${{ runner.temp }}/cached
+
+      - name: Generate the baseline without the cache
+        continue-on-error: true
+        run: pnpm exec vp run --no-cache ng-baseline
+
+      - name: Compare with the cached run's baseline
+        continue-on-error: true
+        run: node .github/replay/baseline.mjs compare "${{ runner.temp }}/cached/ng-baseline-fixtures.json" napi/angular-compiler/e2e/compare/ng-baseline-fixtures.json "${{ runner.temp }}/replay-diff"
+
+      - if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-diff
+          path: ${{ runner.temp }}/replay-diff
+          if-no-files-found: ignore
+          retention-days: 30
