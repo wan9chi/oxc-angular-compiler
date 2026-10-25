@@ -680,7 +680,7 @@ fn extract_constructor_deps<'a>(
             let params = &ctor.value.params;
 
             for param in &params.items {
-                let dep = extract_param_dependency(param, import_map, consts);
+                let dep = extract_param_dependency(allocator, param, import_map, consts);
                 deps.push(dep);
             }
 
@@ -703,6 +703,7 @@ fn extract_constructor_deps<'a>(
 /// Only Angular's parameter decorators count, imported from `@angular/core`
 /// (see [`crate::directive::angular_param_decorator`]).
 fn extract_param_dependency<'a>(
+    allocator: &'a Allocator,
     param: &'a oxc_ast::ast::FormalParameter<'a>,
     import_map: &ImportMap<'a>,
     consts: &StringConsts<'a>,
@@ -754,7 +755,12 @@ fn extract_param_dependency<'a>(
     // Determine the token:
     // 1. If @Inject(TOKEN) is present, use TOKEN
     // 2. Otherwise, use the type annotation
-    let token = inject_token.or_else(|| extract_param_token(param));
+    let (token, member_path) = match inject_token {
+        Some(token) => (Some(token), &[][..]),
+        None => {
+            extract_param_token(allocator, param).map_or((None, &[][..]), |(t, m)| (Some(t), m))
+        }
+    };
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
@@ -785,6 +791,9 @@ fn extract_param_dependency<'a>(
                 } else {
                     let mut d = R3DependencyMetadata::new(token_name.clone());
                     d.token_source_module = Some(import_info.source_module.clone());
+                    d.token_member_path = member_path;
+                    d.token_is_namespace_import =
+                        !member_path.is_empty() && !import_info.is_named_import;
                     // Carry the exported name so namespaced refs (`i1.X`) use the export
                     // name, not the local alias, for aliased imports.
                     d.token_imported_name = import_info.imported_name.clone();
@@ -795,7 +804,9 @@ fn extract_param_dependency<'a>(
                     d
                 }
             } else {
-                R3DependencyMetadata::new(token_name.clone())
+                let mut d = R3DependencyMetadata::new(*token_name);
+                d.token_member_path = member_path;
+                d
             }
         }
         None => R3DependencyMetadata::invalid(),
@@ -836,29 +847,23 @@ fn extract_inject_token<'a>(arg: &'a Argument<'a>) -> Option<Ident<'a>> {
     }
 }
 
-/// Extract the injection token from a parameter's type annotation.
-fn extract_param_token<'a>(param: &'a oxc_ast::ast::FormalParameter<'a>) -> Option<Ident<'a>> {
+/// Extract the injection token from a parameter's type annotation: its
+/// leftmost name and the members read off it (`ns.one.One` → `ns`, `[one, One]`).
+fn extract_param_token<'a>(
+    allocator: &'a Allocator,
+    param: &'a oxc_ast::ast::FormalParameter<'a>,
+) -> Option<(Ident<'a>, &'a [Ident<'a>])> {
     // Get the type annotation (directly on FormalParameter)
     let type_annotation = param.type_annotation.as_ref()?;
     // Narrow `T | null` unions to `T` to match the reference compiler.
     let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
-    // Handle TSTypeReference: SomeClass, SomeModule, etc.
-    if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
-        // Get the type name
-        let type_name = match &type_ref.type_name {
-            oxc_ast::ast::TSTypeName::IdentifierReference(id) => Some(id.name.clone().into()),
-            oxc_ast::ast::TSTypeName::QualifiedName(_)
-            | oxc_ast::ast::TSTypeName::ThisExpression(_) => {
-                // Qualified names like Namespace.Type or 'this' type - not valid injection tokens
-                None
-            }
-        };
-        return type_name;
-    }
-
-    // For primitive types or other patterns, return None (invalid dependency)
-    None
+    // Handle TSTypeReference: `SomeClass`, or a qualified `ns.SomeClass`.
+    // For primitive types, `this` or other patterns, return None (invalid dependency).
+    let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type else { return None };
+    let path = crate::class_metadata::entity_path(&type_ref.type_name)?;
+    let (root, members) = path.split_first()?;
+    Some((*root, allocator.alloc_slice_copy(members)))
 }
 
 // =============================================================================

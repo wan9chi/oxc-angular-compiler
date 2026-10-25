@@ -843,10 +843,11 @@ fn clone_factory_deps<'a>(
                             &allocator,
                         ))
                     } else {
-                        OutputExpression::ReadVar(Box::new_in(
+                        let token = OutputExpression::ReadVar(Box::new_in(
                             ReadVarExpr { name: t.clone(), source_span: None },
                             &allocator,
-                        ))
+                        ));
+                        crate::util::read_member_path(allocator, token, dep.token_member_path)
                     }
                 });
                 let attr_expr = dep.attribute_name.as_ref().map(|a| {
