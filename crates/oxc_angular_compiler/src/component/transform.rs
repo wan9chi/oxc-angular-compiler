@@ -4545,7 +4545,7 @@ pub fn transform_angular_file(
 
     // The analyzer counts an Angular constructor parameter decorator, and the Angular decorator of a `declare`
     // property, as removed on every class with an Angular class decorator. One the walk above left in place (a
-    // component whose template is missing, a constructor after the first) keeps what it references.
+    // component whose template is missing, a constructor other than the implementation) keeps what it references.
     {
         let stripped: rustc_hash::FxHashSet<Span> =
             decorator_spans_to_remove.iter().copied().collect();
