@@ -86,3 +86,50 @@ export class M {
     );
     assert_injects_attribute(&code);
 }
+
+/// The `.d.ts` factory type names the attribute, as ngtsc's `createCtorDepType`
+/// writes `attributeNameType`: `[{ attribute: "title"; optional: true; }]`.
+#[test]
+fn factory_declaration_names_the_attribute() {
+    let source = r#"
+import { Attribute, Directive, Injectable, NgModule, Optional, Pipe } from '@angular/core';
+@Directive({ selector: '[d]' })
+export class D { constructor(@Optional() @Attribute('title') t: string) {} }
+@Pipe({ name: 'p' })
+export class P { constructor(@Attribute('say "hi"') t: string) {} transform(v: unknown) { return v; } }
+@Injectable()
+export class S { constructor(@Attribute('title') t: string) {} }
+@NgModule({})
+export class M { constructor(@Attribute('title') t: string) {} }
+"#;
+    let allocator = Allocator::default();
+    let result = transform_angular_file(
+        &allocator,
+        "test.ts",
+        source,
+        Some(&TransformOptions::default()),
+        None,
+    );
+    let factory_type = |class: &str| {
+        let decl = result.dts_declarations.iter().find(|d| d.class_name == class).unwrap();
+        let line = decl.members.lines().find(|l| l.contains("static ɵfac")).unwrap();
+        line.trim().to_string()
+    };
+    assert!(
+        factory_type("D").contains(r#"[{ attribute: "title", optional: true }]"#),
+        "{}",
+        factory_type("D")
+    );
+    assert!(
+        factory_type("P").contains(r#"[{ attribute: "say \"hi\"" }]"#),
+        "{}",
+        factory_type("P")
+    );
+    for class in ["S", "M"] {
+        assert!(
+            factory_type(class).contains(r#"[{ attribute: "title" }]"#),
+            "{}",
+            factory_type(class)
+        );
+    }
+}
