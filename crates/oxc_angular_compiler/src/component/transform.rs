@@ -57,7 +57,7 @@ use crate::ng_module::{
 };
 use crate::output::ast::{
     ArrowFunctionBody, ArrowFunctionExpr, DeclareFunctionStmt, FunctionExpr, OutputExpression,
-    OutputStatement, ReadPropExpr, ReadVarExpr, StmtModifier,
+    OutputStatement, RawSourceExpr, ReadPropExpr, ReadVarExpr, StmtModifier,
 };
 use crate::output::emitter::JsEmitter;
 use crate::parser::ParseTemplateOptions;
@@ -4567,6 +4567,71 @@ pub fn transform_angular_file(
         }
     }
 
+    // The analyzer counts an Angular constructor parameter decorator, and the Angular decorator of a `declare`
+    // property, as removed on every class with an Angular class decorator. One the walk above left in place (a
+    // component whose template is missing, a constructor after the first) keeps what it references.
+    {
+        let stripped: rustc_hash::FxHashSet<Span> =
+            decorator_spans_to_remove.iter().copied().collect();
+        let mut kept = DecoratorIdentifiers::default();
+        for stmt in &parser_ret.program.body {
+            let class = match stmt {
+                Statement::ClassDeclaration(class) => class.as_ref(),
+                Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                    ExportDefaultDeclarationKind::ClassDeclaration(class) => class.as_ref(),
+                    _ => continue,
+                },
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::ClassDeclaration(class) => class.as_ref(),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            for element in &class.body.body {
+                let decorators: std::vec::Vec<_> = match element {
+                    oxc_ast::ast::ClassElement::MethodDefinition(method)
+                        if method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor =>
+                    {
+                        method
+                            .value
+                            .params
+                            .items
+                            .iter()
+                            .flat_map(|param| &param.decorators)
+                            .filter(|decorator| {
+                                crate::directive::angular_param_decorator(
+                                    decorator,
+                                    Some(&string_consts),
+                                )
+                                .is_some()
+                            })
+                            .collect()
+                    }
+                    oxc_ast::ast::ClassElement::PropertyDefinition(prop) if prop.declare => prop
+                        .decorators
+                        .iter()
+                        .filter(|decorator| {
+                            crate::directive::angular_member_decorator(
+                                decorator,
+                                Some(&string_consts),
+                            )
+                            .is_some()
+                        })
+                        .collect(),
+                    _ => continue,
+                };
+                for decorator in decorators {
+                    if !stripped.contains(&decorator.span) {
+                        oxc_ast_visit::Visit::visit_decorator(&mut kept, decorator);
+                    }
+                }
+            }
+        }
+        for name in kept.0 {
+            import_elision_mut.preserve(name);
+        }
+    }
+
     // 5. Generate output code using span-based edits from the original AST.
     // All edits reference positions in the original source and are applied in one pass.
 
@@ -5684,6 +5749,7 @@ fn compile_component_full<'a>(
         // PerComponent mode: pass the shared resolver expression so the
         // ingest stage attaches it to every defer block's create op.
         all_deferrable_deps_fn: defer_resolver_fn,
+        defer_blocks: FxHashMap::default(),
         // Use the shared pool starting index to avoid duplicate constant names
         // when compiling multiple components in the same file
         pool_starting_index,
@@ -6239,6 +6305,7 @@ pub fn compile_template_to_js_with_options<'a>(
         enable_debug_locations,
         template_source: Some(template),
         all_deferrable_deps_fn: None,
+        defer_blocks: FxHashMap::default(),
         pool_starting_index: 0, // Standalone template compilation starts from 0
         angular_version: options.angular_version,
         legacy_optional_chaining: options.legacy_optional_chaining,
@@ -6425,6 +6492,7 @@ pub fn compile_template_for_hmr<'a>(
         enable_debug_locations,
         template_source: Some(template),
         all_deferrable_deps_fn: None,
+        defer_blocks: FxHashMap::default(),
         pool_starting_index: 0, // HMR template compilation starts from 0
         angular_version: options.angular_version,
         legacy_optional_chaining: options.legacy_optional_chaining,
@@ -7089,6 +7157,7 @@ pub fn compile_template_for_linker<'a>(
     preserve_whitespaces: bool,
     core_namespace: &str,
     angular_version: Option<crate::AngularVersion>,
+    defer_block_deps: &[Option<&str>],
 ) -> Result<LinkerTemplateOutput, std::vec::Vec<OxcDiagnostic>> {
     use crate::pipeline::ingest::{IngestOptions, ingest_component_with_options};
     use oxc_allocator::FromIn;
@@ -7137,6 +7206,23 @@ pub fn compile_template_for_linker<'a>(
         return Err(diagnostics);
     }
 
+    // Like the TS linker's `createR3ComponentDeferMetadata`: the i-th entry of
+    // `deferBlockDependencies` belongs to the i-th `@defer` block, and a block
+    // past the end of the list (or a `null` entry) has no dependency function.
+    let defer_blocks = super::defer_resolver::defer_block_spans(&r3_result.nodes)
+        .into_iter()
+        .enumerate()
+        .map(|(i, span)| {
+            let deps_fn = defer_block_deps.get(i).copied().flatten().map(|source| {
+                OutputExpression::RawSource(oxc_allocator::Box::new_in(
+                    RawSourceExpr { source: Ident::from_in(source, &allocator), source_span: None },
+                    &allocator,
+                ))
+            });
+            (span, deps_fn)
+        })
+        .collect();
+
     // Stage 3-5: Ingest and compile
     let ingest_options = IngestOptions {
         mode: TemplateCompilationMode::Full,
@@ -7147,6 +7233,7 @@ pub fn compile_template_for_linker<'a>(
         enable_debug_locations: false,
         template_source: Some(template),
         all_deferrable_deps_fn: None,
+        defer_blocks,
         pool_starting_index: 0,
         angular_version,
         // Angular's linker uses native `?.` for declarations at version 22+ (and the
