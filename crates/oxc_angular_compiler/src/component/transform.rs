@@ -5320,6 +5320,7 @@ fn compile_component_partial<'a>(
     view_queries: &[R3QueryMetadata<'a>],
     content_queries: &[R3QueryMetadata<'a>],
     pool_starting_index: u32,
+    namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> FullCompilationResult {
     let inputs = crate::partial::PartialComponentInputs {
         template,
@@ -5337,6 +5338,7 @@ fn compile_component_partial<'a>(
         allocator,
         core_namespace,
         metadata,
+        namespace_registry,
     );
 
     // Detect `@defer` block presence by a cheap string scan — partial
@@ -5541,6 +5543,7 @@ fn compile_component_full<'a>(
             &view_queries,
             &content_queries,
             pool_starting_index,
+            namespace_registry,
         ));
     }
 

@@ -127,21 +127,45 @@ export class APipe {
     assert_contains(&code, "(i0.ɵɵdirectiveInject(i1.one.One,16))");
 }
 
-/// Partial compilation declares the token as written.
+/// Partial compilation declares the token off the emitted namespace import,
+/// like ngtsc: import elision drops the user's `import * as ns` / `{ ns }`.
 #[test]
 fn partial_component_declares_the_qualified_token() {
     let options =
         TransformOptions { compilation_mode: CompilationMode::Partial, ..Default::default() };
-    let code = compile_with(
+    for (import, token) in [("* as ns", "{token:i1.one.One}"), ("{ ns }", "{token:i1.ns.one.One}")]
+    {
+        let code = compile_with(
+            &format!(
+                r"
+import {{ Component }} from '@angular/core';
+import {import} from './ns';
+@Component({{ selector: 'a-cmp', template: '' }})
+export class ACmp {{
+  constructor(one: ns.one.One) {{}}
+}}
+"
+            ),
+            &options,
+        );
+        assert_contains(&code, "import*asi1from'./ns';");
+        assert_contains(&code, &format!("deps:[{token}]"));
+    }
+}
+
+/// A component's `@Inject(TOKEN.sub)` is injected, not the parameter type.
+#[test]
+fn component_inject_member_chain_wins_over_the_type() {
+    let code = compile(
         r"
-import { Component } from '@angular/core';
+import { Component, Inject } from '@angular/core';
 import * as ns from './ns';
+import { TOKEN } from './tokens';
 @Component({ selector: 'a-cmp', template: '' })
 export class ACmp {
-  constructor(one: ns.one.One) {}
+  constructor(@Inject(TOKEN.a.b) a: ns.Zero, @Inject(ns.TOKEN) b: unknown) {}
 }
 ",
-        &options,
     );
-    assert_contains(&code, "deps:[{token:ns.one.One}]");
+    assert_contains(&code, "(i0.ɵɵdirectiveInject(i1.TOKEN.a.b),i0.ɵɵdirectiveInject(i2.TOKEN))");
 }

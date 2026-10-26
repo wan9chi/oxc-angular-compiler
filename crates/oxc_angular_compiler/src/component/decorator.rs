@@ -713,7 +713,7 @@ fn extract_param_dependency<'a>(
     let mut skip_self = false;
     let mut self_ = false;
     let mut host = false;
-    let mut inject_token: Option<Ident<'a>> = None;
+    let mut inject_token: Option<(Ident<'a>, &'a [Ident<'a>])> = None;
     let mut inject_token_is_string = false;
     let mut attribute_name: Option<Ident<'a>> = None;
 
@@ -729,7 +729,9 @@ fn extract_param_dependency<'a>(
                             let string_token =
                                 arg.as_expression().and_then(extract_string_inject_token);
                             inject_token_is_string = string_token.is_some();
-                            inject_token = string_token.or_else(|| extract_inject_token(arg));
+                            inject_token = string_token
+                                .map(|token| (token, &[][..]))
+                                .or_else(|| extract_inject_token(allocator, arg));
                         }
                     }
                 }
@@ -755,12 +757,9 @@ fn extract_param_dependency<'a>(
     // Determine the token:
     // 1. If @Inject(TOKEN) is present, use TOKEN
     // 2. Otherwise, use the type annotation
-    let (token, member_path) = match inject_token {
-        Some(token) => (Some(token), &[][..]),
-        None => {
-            extract_param_token(allocator, param).map_or((None, &[][..]), |(t, m)| (Some(t), m))
-        }
-    };
+    let (token, member_path) = inject_token
+        .or_else(|| extract_param_token(allocator, param))
+        .map_or((None, &[][..]), |(t, m)| (Some(t), m));
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
@@ -832,19 +831,21 @@ fn extract_string_inject_token<'a>(expr: &'a Expression<'a>) -> Option<Ident<'a>
     }
 }
 
-/// Extract the injection token from an @Inject decorator argument.
-fn extract_inject_token<'a>(arg: &'a Argument<'a>) -> Option<Ident<'a>> {
-    match arg {
-        Argument::Identifier(id) => Some(id.name.clone().into()),
-        _ => {
-            // For other expressions, try to get the expression form
-            let expr = arg.to_expression();
-            match expr {
-                Expression::Identifier(id) => Some(id.name.clone().into()),
-                _ => None,
-            }
-        }
+/// Extract the injection token from an @Inject decorator argument: its leftmost
+/// name and the members read off it (`TOKEN.a.b` → `TOKEN`, `[a, b]`).
+fn extract_inject_token<'a>(
+    allocator: &'a Allocator,
+    arg: &'a Argument<'a>,
+) -> Option<(Ident<'a>, &'a [Ident<'a>])> {
+    let mut members = std::vec::Vec::new();
+    let mut expr = arg.as_expression()?;
+    while let Expression::StaticMemberExpression(member) = expr {
+        members.push(member.property.name);
+        expr = &member.object;
     }
+    let Expression::Identifier(id) = expr else { return None };
+    members.reverse();
+    Some((id.name, allocator.alloc_slice_copy(&members)))
 }
 
 /// Extract the injection token from a parameter's type annotation: its

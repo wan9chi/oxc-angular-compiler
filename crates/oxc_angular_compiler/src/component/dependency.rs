@@ -390,7 +390,7 @@ fn compile_inject_dependency<'a>(
 ///
 /// This mimics Angular's import reuse behavior where existing named imports
 /// are reused rather than generating new namespace imports.
-fn create_token_expression<'a>(
+pub fn create_token_expression<'a>(
     allocator: &'a Allocator,
     dep: &R3DependencyMetadata<'a>,
     token_name: &Ident<'a>,
