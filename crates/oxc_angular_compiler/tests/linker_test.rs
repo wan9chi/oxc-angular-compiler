@@ -330,18 +330,24 @@ fn test_link_does_not_sanitize_img_video_src_from_22_2_2() {
     assert_eq!(default_link, link_for_version(SRC_BINDINGS_COMPONENT, None));
 }
 
-/// Checks that the application's version reaches the directive host path: before 22.2.2,
-/// `img|src` is in the URL schema, so the host binding must be sanitized.
-/// Only "sanitized" is asserted, not which sanitizer, and 22.2.2 is not asserted at all:
-/// Angular emits `ɵɵsanitizeUrlOrResourceUrl` here for both versions (concrete host security
-/// contexts, angular/angular@d06e3748b7), which OXC does not port yet.
+/// Checks that the application's version reaches the directive host path. 22.0.8 still
+/// picks the sanitizer from the `img` selector (`img|src` is a URL there); from 22.1.0 the
+/// binding is checked against every concrete host (angular/angular@d06e3748b7), so `src`
+/// defers the URL / resource URL choice to runtime.
 #[test]
 fn test_link_host_src_binding_respects_angular_version() {
-    let code = link_for_version(SRC_HOST_DIRECTIVE, Some(AngularVersion::new(22, 2, 1)));
+    let code = link_for_version(SRC_HOST_DIRECTIVE, Some(AngularVersion::new(22, 0, 8)));
     assert!(
-        code.contains(r#"ɵɵdomProperty("src",ctx.url,i0.ɵɵsanitize"#),
-        "22.2.1 must reach the directive host path and sanitize `img|src`:\n{code}"
+        code.contains(r#"ɵɵdomProperty("src",ctx.url,i0.ɵɵsanitizeUrl)"#),
+        "22.0.8 must sanitize `img|src` from the selector:\n{code}"
     );
+    for version in [Some(AngularVersion::new(22, 2, 1)), None] {
+        let code = link_for_version(SRC_HOST_DIRECTIVE, version);
+        assert!(
+            code.contains(r#"ɵɵdomProperty("src",ctx.url,i0.ɵɵsanitizeUrlOrResourceUrl)"#),
+            "{version:?} must sanitize `src` for any concrete host:\n{code}"
+        );
+    }
 }
 
 /// Component host bindings follow the application's version (`ɵɵhostProperty` before 20,
@@ -629,4 +635,76 @@ export { P };
         "`export` line {out_line} should map to source line {src_line}:\n{}",
         result.code
     );
+}
+
+#[test]
+fn test_link_escapes_metadata_strings() {
+    let code = r#"import * as i0 from "@angular/core";
+export class P {}
+P.ɵpipe = i0.ɵɵngDeclarePipe({ minVersion: "14.0.0", version: "21.0.0", ngImport: i0, type: P, isStandalone: true, name: 'a"+x+"' });
+export class D {}
+D.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21.0.0", ngImport: i0, type: D, isStandalone: true, selector: "[t='a\"b']", inputs: { 'a.b"c': "c" }, host: { classAttribute: 'k"+x+"' }, controlCreate: { passThroughInput: 'f"+x+"' } });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    for expected in [
+        r#"name: "a\"+x+\"""#,
+        r#"selectors: [["", "t", "a\"b"]]"#,
+        r#"inputs: { "a.b\"c": "c" }"#,
+        r#"hostAttrs: [1, "k\"+x+\""]"#,
+        r#"ɵɵControlFeature("f\"+x+\"")"#,
+    ] {
+        assert!(result.code.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+}
+
+#[test]
+fn test_link_defer_block_dependencies() {
+    // `deferBlockDependencies` follows the binder's block order: the outer
+    // block, the block nested in it, the block in its placeholder, then the
+    // next top-level block.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", ngImport: i0, type: C, isStandalone: true, selector: "c", template: "@defer { <lazy-cmp/> @defer { <b-b></b-b> } } @placeholder { @defer { <i-i></i-i> } } @defer (on idle) { <x-y/> }", deferBlockDependencies: [() => [import("./lazy").then(m => m.LazyCmp)], null, () => [import("./b").then(m => m.B)], () => [import("./x").then(m => m.X), import("./y").then(m => m.Y)]] });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    // Fragments of the TS linker's output.
+    for expected in [
+        r#"constC_Defer_2_DepsFn=()=>[import("./lazy").then(m=>m.LazyCmp)];"#,
+        r#"constC_Defer_5_DepsFn=()=>[import("./x").then(m=>m.X),import("./y").then(m=>m.Y)];"#,
+        r#"constC_DeferPlaceholder_1_Defer_1_DepsFn=()=>[import("./b").then(m=>m.B)];"#,
+        "i0.ɵɵdefer(2,1);",
+        "i0.ɵɵdefer(1,0,C_DeferPlaceholder_1_Defer_1_DepsFn);",
+        "i0.ɵɵdefer(2,0,C_Defer_2_DepsFn,null,1);",
+        "i0.ɵɵdefer(5,4,C_Defer_5_DepsFn);",
+    ] {
+        assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+}
+
+#[test]
+fn test_link_defer_block_dependencies_in_parentheses() {
+    // Babel's AST has no parentheses: `(null)` is a null entry, and an entry is
+    // emitted without the parentheses around it, as the TS linker does.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", ngImport: i0, type: C, isStandalone: true, selector: "c", template: "@defer { m1 } @defer { m2 }", deferBlockDependencies: [(() => [import("./a")]), (null)] });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    // Fragments of the TS linker's output.
+    for expected in [
+        r#"constC_Defer_1_DepsFn=()=>[import("./a")];"#,
+        "i0.ɵɵdefer(1,0,C_Defer_1_DepsFn);",
+        "i0.ɵɵdefer(4,3);",
+    ] {
+        assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+    assert!(!linked.contains("C_Defer_4_DepsFn"), "{}", result.code);
 }

@@ -576,15 +576,18 @@ fn extract_param_dependency<'a>(
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
+        let name = OutputExpression::Literal(Box::new_in(
+            crate::output::ast::LiteralExpr {
+                value: crate::output::ast::LiteralValue::String(attr_name),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        // ngtsc's `attributeNameType` is the attribute name itself (di.ts), so it is
+        // set whatever the parameter's type and compiles to `ɵɵinjectAttribute`.
         return R3DependencyMetadata {
-            token: Some(OutputExpression::Literal(Box::new_in(
-                crate::output::ast::LiteralExpr {
-                    value: crate::output::ast::LiteralValue::String(attr_name),
-                    source_span: None,
-                },
-                &allocator,
-            ))),
-            attribute_name_type: token, // The type annotation
+            token: Some(name.clone_in(allocator)),
+            attribute_name_type: Some(name),
             host,
             optional,
             self_,
@@ -614,22 +617,9 @@ fn extract_param_token<'a>(
     // Narrow `T | null` unions to `T` to match the reference compiler.
     let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
-    // Handle TSTypeReference: SomeClass, SomeModule, etc.
+    // Handle TSTypeReference: `SomeClass`, or a qualified `ns.SomeClass`.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
-        // Get the type name
-        let type_name: Ident<'a> = match &type_ref.type_name {
-            oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.clone().into(),
-            oxc_ast::ast::TSTypeName::QualifiedName(_)
-            | oxc_ast::ast::TSTypeName::ThisExpression(_) => {
-                // Qualified names like Namespace.Type or 'this' type - not valid injection tokens
-                return None;
-            }
-        };
-
-        return Some(OutputExpression::ReadVar(Box::new_in(
-            ReadVarExpr { name: type_name, source_span: None },
-            &allocator,
-        )));
+        return crate::util::type_name_to_value_expr(allocator, &type_ref.type_name);
     }
 
     // For primitive types or other patterns, return None (invalid dependency)
