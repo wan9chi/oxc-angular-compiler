@@ -18,9 +18,9 @@ use super::metadata::{
 };
 use super::transform::ImportMap;
 use crate::directive::{
-    HostKey, MemberHostBindings, StringConsts, evaluate_host_directives, extract_input_metadata_in,
-    extract_output_metadata_in, merge_by_class_property, merge_host_bindings, parse_decorator_io,
-    try_unwrap_forward_ref,
+    HostKey, HostValue, MemberHostBindings, StringConsts, evaluate_host_directives,
+    extract_input_metadata_in, extract_output_metadata_in, merge_by_class_property,
+    merge_host_bindings, parse_decorator_io, try_unwrap_forward_ref,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::util::is_metadata_property;
@@ -171,7 +171,8 @@ pub fn extract_component_metadata<'a>(
                     // an invalid one must not be applied here where it would
                     // be dropped silently.
                     if !prop.computed {
-                        metadata.host = extract_host_metadata(allocator, &prop.value, consts);
+                        metadata.host =
+                            extract_host_metadata(allocator, &prop.value, source_text, consts);
                     }
                 }
                 "imports" => {
@@ -210,7 +211,7 @@ pub fn extract_component_metadata<'a>(
                 }
                 "preserveWhitespaces" => {
                     metadata.preserve_whitespaces =
-                        extract_boolean_value(&prop.value).unwrap_or(false);
+                        Some(extract_boolean_value(&prop.value).unwrap_or(false));
                 }
                 "animations" => {
                     // Extract animations expression as full OutputExpression
@@ -566,6 +567,7 @@ fn extract_change_detection(expr: &Expression<'_>) -> ChangeDetectionStrategy {
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
+    source_text: Option<&'a str>,
     consts: &StringConsts<'a>,
 ) -> Option<HostMetadata<'a>> {
     // An unusable host is reported by `decorator_io_errors`.
@@ -574,12 +576,19 @@ fn extract_host_metadata<'a>(
 
     let mut host = HostMetadata::new(allocator);
     for (key, value) in entries {
-        match HostKey::of(key.as_str()) {
+        let kind = HostKey::of(key.as_str());
+        if matches!(kind, HostKey::Attribute) {
+            host.attributes.push((key, value.to_output(allocator, source_text)?));
+            continue;
+        }
+        // Only a plain attribute has an expression value.
+        let HostValue::String(value) = value else { continue };
+        match kind {
             HostKey::Property => host.properties.push((key, value)),
             HostKey::Listener => host.listeners.push((key, value)),
             HostKey::Class => host.class_attr = Some(value),
             HostKey::Style => host.style_attr = Some(value),
-            HostKey::Attribute => host.attributes.push((key, value)),
+            HostKey::Attribute => {}
         }
     }
     Some(host)
@@ -686,14 +695,7 @@ fn extract_constructor_deps<'a>(
     consts: &StringConsts<'a>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
-    let constructor = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    });
+    let constructor = crate::util::find_constructor(class);
 
     match constructor {
         Some(ctor) => {
@@ -702,7 +704,7 @@ fn extract_constructor_deps<'a>(
             let params = &ctor.value.params;
 
             for param in &params.items {
-                let dep = extract_param_dependency(param, import_map, consts);
+                let dep = extract_param_dependency(allocator, param, import_map, consts);
                 deps.push(dep);
             }
 
@@ -725,6 +727,7 @@ fn extract_constructor_deps<'a>(
 /// Only Angular's parameter decorators count, imported from `@angular/core`
 /// (see [`crate::directive::angular_param_decorator`]).
 fn extract_param_dependency<'a>(
+    allocator: &'a Allocator,
     param: &'a oxc_ast::ast::FormalParameter<'a>,
     import_map: &ImportMap<'a>,
     consts: &StringConsts<'a>,
@@ -734,7 +737,7 @@ fn extract_param_dependency<'a>(
     let mut skip_self = false;
     let mut self_ = false;
     let mut host = false;
-    let mut inject_token: Option<Ident<'a>> = None;
+    let mut inject_token: Option<(Ident<'a>, &'a [Ident<'a>])> = None;
     let mut inject_token_is_string = false;
     let mut attribute_name: Option<Ident<'a>> = None;
 
@@ -750,7 +753,9 @@ fn extract_param_dependency<'a>(
                             let string_token =
                                 arg.as_expression().and_then(extract_string_inject_token);
                             inject_token_is_string = string_token.is_some();
-                            inject_token = string_token.or_else(|| extract_inject_token(arg));
+                            inject_token = string_token
+                                .map(|token| (token, &[][..]))
+                                .or_else(|| extract_inject_token(allocator, arg));
                         }
                     }
                 }
@@ -776,7 +781,9 @@ fn extract_param_dependency<'a>(
     // Determine the token:
     // 1. If @Inject(TOKEN) is present, use TOKEN
     // 2. Otherwise, use the type annotation
-    let token = inject_token.or_else(|| extract_param_token(param));
+    let (token, member_path) = inject_token
+        .or_else(|| extract_param_token(allocator, param))
+        .map_or((None, &[][..]), |(t, m)| (Some(t), m));
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
@@ -807,6 +814,9 @@ fn extract_param_dependency<'a>(
                 } else {
                     let mut d = R3DependencyMetadata::new(token_name.clone());
                     d.token_source_module = Some(import_info.source_module.clone());
+                    d.token_member_path = member_path;
+                    d.token_is_namespace_import =
+                        !member_path.is_empty() && !import_info.is_named_import;
                     // Carry the exported name so namespaced refs (`i1.X`) use the export
                     // name, not the local alias, for aliased imports.
                     d.token_imported_name = import_info.imported_name.clone();
@@ -817,7 +827,9 @@ fn extract_param_dependency<'a>(
                     d
                 }
             } else {
-                R3DependencyMetadata::new(token_name.clone())
+                let mut d = R3DependencyMetadata::new(*token_name);
+                d.token_member_path = member_path;
+                d
             }
         }
         None => R3DependencyMetadata::invalid(),
@@ -843,44 +855,40 @@ fn extract_string_inject_token<'a>(expr: &'a Expression<'a>) -> Option<Ident<'a>
     }
 }
 
-/// Extract the injection token from an @Inject decorator argument.
-fn extract_inject_token<'a>(arg: &'a Argument<'a>) -> Option<Ident<'a>> {
-    match arg {
-        Argument::Identifier(id) => Some(id.name.clone().into()),
-        _ => {
-            // For other expressions, try to get the expression form
-            let expr = arg.to_expression();
-            match expr {
-                Expression::Identifier(id) => Some(id.name.clone().into()),
-                _ => None,
-            }
-        }
+/// Extract the injection token from an @Inject decorator argument: its leftmost
+/// name and the members read off it (`TOKEN.a.b` → `TOKEN`, `[a, b]`).
+fn extract_inject_token<'a>(
+    allocator: &'a Allocator,
+    arg: &'a Argument<'a>,
+) -> Option<(Ident<'a>, &'a [Ident<'a>])> {
+    let mut members = std::vec::Vec::new();
+    let mut expr = arg.as_expression()?;
+    while let Expression::StaticMemberExpression(member) = expr {
+        members.push(member.property.name);
+        expr = &member.object;
     }
+    let Expression::Identifier(id) = expr else { return None };
+    members.reverse();
+    Some((id.name, allocator.alloc_slice_copy(&members)))
 }
 
-/// Extract the injection token from a parameter's type annotation.
-fn extract_param_token<'a>(param: &'a oxc_ast::ast::FormalParameter<'a>) -> Option<Ident<'a>> {
+/// Extract the injection token from a parameter's type annotation: its
+/// leftmost name and the members read off it (`ns.one.One` → `ns`, `[one, One]`).
+fn extract_param_token<'a>(
+    allocator: &'a Allocator,
+    param: &'a oxc_ast::ast::FormalParameter<'a>,
+) -> Option<(Ident<'a>, &'a [Ident<'a>])> {
     // Get the type annotation (directly on FormalParameter)
     let type_annotation = param.type_annotation.as_ref()?;
     // Narrow `T | null` unions to `T` to match the reference compiler.
     let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
-    // Handle TSTypeReference: SomeClass, SomeModule, etc.
-    if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
-        // Get the type name
-        let type_name = match &type_ref.type_name {
-            oxc_ast::ast::TSTypeName::IdentifierReference(id) => Some(id.name.clone().into()),
-            oxc_ast::ast::TSTypeName::QualifiedName(_)
-            | oxc_ast::ast::TSTypeName::ThisExpression(_) => {
-                // Qualified names like Namespace.Type or 'this' type - not valid injection tokens
-                None
-            }
-        };
-        return type_name;
-    }
-
-    // For primitive types or other patterns, return None (invalid dependency)
-    None
+    // Handle TSTypeReference: `SomeClass`, or a qualified `ns.SomeClass`.
+    // For primitive types, `this` or other patterns, return None (invalid dependency).
+    let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type else { return None };
+    let path = crate::class_metadata::entity_path(&type_ref.type_name)?;
+    let (root, members) = path.split_first()?;
+    Some((*root, allocator.alloc_slice_copy(members)))
 }
 
 // =============================================================================
@@ -923,14 +931,7 @@ fn for_each_constructor_param_decorator<'a>(
     class: &'a Class<'a>,
     mut f: impl FnMut(&'a Decorator<'a>),
 ) {
-    let constructor = class.body.body.iter().find_map(|element| match element {
-        ClassElement::MethodDefinition(method)
-            if method.kind == MethodDefinitionKind::Constructor =>
-        {
-            Some(method)
-        }
-        _ => None,
-    });
+    let constructor = crate::util::find_constructor(class);
     for param in constructor.into_iter().flat_map(|ctor| &ctor.value.params.items) {
         param.decorators.iter().for_each(&mut f);
     }
@@ -1689,7 +1690,7 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(true));
         });
     }
 
@@ -1705,12 +1706,12 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(!meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(false));
         });
     }
 
     #[test]
-    fn test_preserve_whitespaces_defaults_to_false() {
+    fn test_preserve_whitespaces_unset() {
         let code = r#"
             import {Component} from '@angular/core';
             @Component({
@@ -1720,7 +1721,7 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(!meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, None);
         });
     }
 
@@ -1853,7 +1854,7 @@ mod tests {
             assert_eq!(meta.imports.len(), 1);
             assert_eq!(meta.export_as.len(), 1);
             assert_eq!(meta.export_as[0].as_str(), "complete");
-            assert!(meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(true));
             assert_eq!(meta.schemas.len(), 1);
         });
     }

@@ -39,7 +39,7 @@ use super::{PLACEHOLDER_VERSION, wrap_forward_ref};
 use crate::component::R3DependencyMetadata as ComponentDep;
 use crate::component::{
     ChangeDetectionStrategy, ComponentMetadata, DeclarationListEmitMode, HostDirectiveMetadata,
-    HostMetadata, TemplateDependency, TemplateDependencyKind, ViewEncapsulation,
+    HostMetadata, NamespaceRegistry, TemplateDependency, TemplateDependencyKind, ViewEncapsulation,
 };
 use crate::directive::{R3InputMetadata, R3QueryMetadata};
 use crate::factory::{
@@ -337,7 +337,7 @@ pub fn compile_declare_component_from_metadata<'a>(
         ));
     }
 
-    if meta.preserve_whitespaces {
+    if meta.preserve_whitespaces == Some(true) {
         entries.push(LiteralMapEntry::new(
             Ident::from("preserveWhitespaces"),
             bool_lit(allocator, true),
@@ -363,10 +363,14 @@ pub fn compile_declare_component_from_metadata<'a>(
 }
 
 /// Builds the partial ɵfac factory paired with a Component.
+///
+/// Tokens are built as in full mode (`i1.Zero`, `i1.one.One`): import elision drops
+/// an import used only as a constructor parameter type.
 pub fn compile_declare_factory_for_component<'a>(
     allocator: &'a Allocator,
     core_namespace: &'a str,
     meta: &ComponentMetadata<'a>,
+    namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> OutputExpression<'a> {
     let type_expr = OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: meta.class_name.clone(), source_span: None },
@@ -378,7 +382,12 @@ pub fn compile_declare_factory_for_component<'a>(
         type_expr: type_expr.clone_in(allocator),
         type_decl: type_expr,
         type_argument_count: 0,
-        deps: clone_factory_deps(allocator, &meta.constructor_deps, meta.uses_inheritance),
+        deps: clone_factory_deps(
+            allocator,
+            &meta.constructor_deps,
+            meta.uses_inheritance,
+            namespace_registry,
+        ),
         target: FactoryTarget::Component,
     });
     compile_declare_factory_function(allocator, core_namespace, &factory_meta)
@@ -558,9 +567,17 @@ fn compile_host_metadata<'a>(
     let mut entries: Vec<'a, LiteralMapEntry<'a>> = Vec::new_in(&allocator);
 
     if !host.attributes.is_empty() {
+        let mut attr_entries: Vec<'a, LiteralMapEntry<'a>> = Vec::new_in(&allocator);
+        for (key, value) in &host.attributes {
+            let quoted = is_unsafe_object_key(key.as_str());
+            attr_entries.push(LiteralMapEntry::new(key.clone(), value.clone_in(allocator), quoted));
+        }
         entries.push(LiteralMapEntry::new(
             Ident::from("attributes"),
-            ident_pairs_to_string_map(allocator, &host.attributes),
+            OutputExpression::LiteralMap(Box::new_in(
+                LiteralMapExpr { entries: attr_entries, source_span: None },
+                &allocator,
+            )),
             false,
         ));
     }
@@ -827,27 +844,14 @@ fn clone_factory_deps<'a>(
     allocator: &'a Allocator,
     deps: &Option<Vec<'a, ComponentDep<'a>>>,
     uses_inheritance: bool,
+    namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> R3FactoryDeps<'a> {
     match deps {
         Some(deps) => {
             let mut out = Vec::with_capacity_in(deps.len(), &allocator);
             for dep in deps {
                 let token_expr = dep.token.as_ref().map(|t| {
-                    if dep.token_is_string {
-                        // `@Inject('TOKEN')` injects the string itself
-                        OutputExpression::Literal(Box::new_in(
-                            LiteralExpr {
-                                value: LiteralValue::String(t.clone()),
-                                source_span: None,
-                            },
-                            &allocator,
-                        ))
-                    } else {
-                        OutputExpression::ReadVar(Box::new_in(
-                            ReadVarExpr { name: t.clone(), source_span: None },
-                            &allocator,
-                        ))
-                    }
+                    crate::component::create_token_expression(allocator, dep, t, namespace_registry)
                 });
                 let attr_expr = dep.attribute_name.as_ref().map(|a| {
                     OutputExpression::Literal(Box::new_in(
