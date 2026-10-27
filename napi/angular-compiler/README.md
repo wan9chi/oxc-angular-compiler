@@ -179,6 +179,7 @@ interface TransformOptions {
   standalone?: boolean
   encapsulation?: 'Emulated' | 'None' | 'ShadowDom'
   changeDetection?: 'Default' | 'OnPush'
+  // Default for components that do not set their own (project-wide option)
   preserveWhitespaces?: boolean
 
   // Cross-file elision
@@ -221,6 +222,10 @@ interface PluginOptions {
 
   // Template hook, applied during both the initial build and HMR
   templateTransform?: (content: string, filePath: string) => string
+
+  // Project-wide default (`angularCompilerOptions.preserveWhitespaces`);
+  // a component's own `preserveWhitespaces` wins (default: false)
+  preserveWhitespaces?: boolean
 }
 ```
 

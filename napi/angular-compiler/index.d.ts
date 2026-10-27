@@ -25,6 +25,24 @@ export interface AngularVersion {
   prerelease?: string
 }
 
+/** Options for `transformForBrowser`. */
+export interface BrowserTransformOptions {
+  /** Generate a source map (default: false) */
+  sourcemap?: boolean
+  /** `async`/`await`, async generators and `for await` as generators, for zone.js (default: true) */
+  lowerAsync?: boolean
+}
+
+/** Result of `transformForBrowser`. */
+export interface BrowserTransformResult {
+  /** The transformed code; empty when there are errors. */
+  code: string
+  /** Source map (if the `sourcemap` option was enabled). */
+  map?: string
+  /** Parse and transform errors. */
+  errors: Array<OxcError>
+}
+
 /** Result of class metadata compilation. */
 export interface ClassMetadataNapiCompileResult {
   /**
@@ -1019,6 +1037,24 @@ export declare function transformAngularFileSync(
   resolvedResources?: ResolvedResources | undefined | null,
 ): TransformResult
 
+/** `transformForBrowserSync` on a worker thread */
+export declare function transformForBrowser(
+  code: string,
+  filename: string,
+  options?: BrowserTransformOptions | undefined | null,
+): Promise<BrowserTransformResult>
+
+/**
+ * TypeScript stripped as `tsc` does it with Angular's settings (`experimentalDecorators`,
+ * `useDefineForClassFields: false`, target ES2022) and `async` lowered to generators, which zone.js needs;
+ * JavaScript gets only the lowering. Runtime helpers are imported from `@oxc-project/runtime`.
+ */
+export declare function transformForBrowserSync(
+  code: string,
+  filename: string,
+  options?: BrowserTransformOptions | undefined | null,
+): BrowserTransformResult
+
 /** Options for transforming an Angular component. */
 export interface TransformOptions {
   /** Generate source maps. */
@@ -1086,7 +1122,8 @@ export interface TransformOptions {
    */
   changeDetection?: string
   /**
-   * Whether to preserve whitespace in templates.
+   * Project-wide `preserveWhitespaces` (`angularCompilerOptions`): the
+   * default for components whose decorator does not set it.
    * Defaults to false if not specified.
    */
   preserveWhitespaces?: boolean
