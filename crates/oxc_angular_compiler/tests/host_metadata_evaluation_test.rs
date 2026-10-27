@@ -374,9 +374,9 @@ fn dynamic_value_of_a_binding() {
 }
 
 /// ngtsc emits a plain attribute's dynamic value as it is written, in `hostAttrs`
-/// (`["role", make()]`). That includes a value computed from an import, which ngtsc's
-/// local compilation mode can't read either (ngtsc_spec.ts: "should accept dynamic host
-/// attribute bindings").
+/// (`["role", make()]`). That includes a value computed from an import whose file has no
+/// readable value (ngtsc_spec.ts: "should accept dynamic host attribute bindings"), but not
+/// the import itself, see [`host_that_depends_on_an_import`].
 #[test]
 fn dynamic_value_of_a_plain_attribute() {
     let make = "declare function make(): string;";
@@ -391,8 +391,13 @@ fn dynamic_value_of_a_plain_attribute() {
             ),
             (
                 "import { SHARED } from './other';",
-                "{ role: SHARED }",
-                r#"hostAttrs:["role",SHARED]"#,
+                "{ role: SHARED + '!' }",
+                r#"hostAttrs:["role",(SHARED+"!")]"#,
+            ),
+            (
+                "import * as ns from './other';",
+                "{ role: ns.foo.bar }",
+                r#"hostAttrs:["role",ns.foo.bar]"#,
             ),
             (
                 "import { foo } from './other';\nconst test = foo.bar();",
@@ -437,7 +442,10 @@ fn dynamic_value_of_a_plain_attribute_out_of_scope() {
 }
 
 /// ngtsc reads another file to evaluate an import. One file at a time, that is an error
-/// that says so, except for a plain attribute (see above).
+/// that says so. A plain attribute set to the import itself (`SHARED`, `ns.SHARED`) is one
+/// too: with no readable value in the other file, ngtsc rejects it in full and local
+/// compilation mode alike ("found unparseable value"), unlike a value computed from it
+/// (see above).
 #[test]
 fn host_that_depends_on_an_import() {
     let imported = |subject: &str| {
@@ -446,10 +454,19 @@ fn host_that_depends_on_an_import() {
              OXC compiles one file at a time and cannot evaluate values from other files."
         )
     };
-    let preamble = "import { SHARED } from './other';";
+    let preamble =
+        "import { SHARED } from './other';\nimport * as ns from './other';\nconst R = SHARED;";
     for (decorator, subject) in [("Component", "@Component.host"), ("Directive", "@Directive.host")]
     {
-        for host in ["SHARED", "{ ...SHARED, role: 'x' }", "{ '(click)': SHARED }"] {
+        for host in [
+            "SHARED",
+            "{ ...SHARED, role: 'x' }",
+            "{ role: SHARED }",
+            "{ role: (SHARED as string) }",
+            "{ role: R }",
+            "{ role: ns.SHARED }",
+            "{ '(click)': SHARED }",
+        ] {
             let source = source(decorator, preamble, host);
             let (_, diagnostics) = compile(&source);
             let [diagnostic] = diagnostics.as_slice() else {

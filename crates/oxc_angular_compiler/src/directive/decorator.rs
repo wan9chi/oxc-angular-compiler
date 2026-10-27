@@ -2018,11 +2018,14 @@ fn evaluate_host_metadata_uncached<'a>(
             Value::Enum { value, .. } => value,
             value => value,
         };
-        // ngtsc's `DynamicValue`. One file at a time, so is a value computed
-        // from an import: ngtsc's local compilation mode can't read the other
-        // file either, and gets a `DynamicValue` for it.
-        let dynamic =
-            value.is_dynamic() || value.is_import() || matches!(value, Value::Function(_));
+        // ngtsc's `DynamicValue`. So is a value computed from an import
+        // (`foo.bar()`), which ngtsc can't evaluate either when the other file
+        // has no readable value. An import named itself (`SHARED`, `ns.SHARED`)
+        // is a `Reference` ngtsc rejects ("found unparseable value"), and is
+        // reported as imported below.
+        let dynamic = value.is_dynamic()
+            || (value.is_import() && !last.origin.is_some_and(|o| consts.scope().names_import(o)))
+            || matches!(value, Value::Function(_));
         match value {
             Value::String(s) => entries.push((alloc(&prop.key), HostValue::String(alloc(s)))),
             // A plain attribute's dynamic value is emitted as it is written
