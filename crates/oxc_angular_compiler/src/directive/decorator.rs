@@ -22,8 +22,8 @@ use super::metadata::{
 };
 use super::property_decorators::try_unwrap_forward_ref;
 use crate::factory::R3DependencyMetadata;
-use crate::output::ast::{OutputAstBuilder, OutputExpression, ReadVarExpr};
-use crate::output::oxc_converter::convert_oxc_expression;
+use crate::output::ast::{OutputAstBuilder, OutputExpression};
+use crate::output::oxc_converter::{convert_oxc_expression, make_raw_source};
 use crate::r3::CORE;
 use crate::util::is_metadata_property;
 use crate::util::lone_surrogate::has_lone_surrogate;
@@ -182,7 +182,7 @@ pub fn extract_directive_metadata<'a>(
                         // where it would be dropped silently.
                         if !prop.computed {
                             host_from_decorator =
-                                extract_host_metadata(allocator, &prop.value, consts);
+                                extract_host_metadata(allocator, &prop.value, source_text, consts);
                         }
                     }
                     "hostDirectives" => {
@@ -300,14 +300,7 @@ fn extract_constructor_deps<'a>(
     consts: &StringConsts<'a>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
-    let constructor = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    });
+    let constructor = crate::util::find_constructor(class);
 
     match constructor {
         Some(ctor) => {
@@ -387,15 +380,18 @@ fn extract_param_dependency<'a>(
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
+        let name = OutputExpression::Literal(Box::new_in(
+            crate::output::ast::LiteralExpr {
+                value: crate::output::ast::LiteralValue::String(attr_name),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        // ngtsc's `attributeNameType` is the attribute name itself (di.ts), so it is
+        // set whatever the parameter's type and compiles to `ɵɵinjectAttribute`.
         return R3DependencyMetadata {
-            token: Some(OutputExpression::Literal(Box::new_in(
-                crate::output::ast::LiteralExpr {
-                    value: crate::output::ast::LiteralValue::String(attr_name),
-                    source_span: None,
-                },
-                &allocator,
-            ))),
-            attribute_name_type: token, // The type annotation
+            token: Some(name.clone_in(allocator)),
+            attribute_name_type: Some(name),
             host,
             optional,
             self_,
@@ -430,22 +426,9 @@ fn extract_param_token<'a>(
     // Narrow `T | null` unions to `T` to match the reference compiler.
     let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
-    // Handle TSTypeReference: SomeClass, SomeModule, etc.
+    // Handle TSTypeReference: `SomeClass`, or a qualified `ns.SomeClass`.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
-        // Get the type name
-        let type_name = match &type_ref.type_name {
-            oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.clone().into(),
-            oxc_ast::ast::TSTypeName::QualifiedName(_)
-            | oxc_ast::ast::TSTypeName::ThisExpression(_) => {
-                // Qualified names like Namespace.Type or 'this' type - not valid injection tokens
-                return None;
-            }
-        };
-
-        return Some(OutputExpression::ReadVar(Box::new_in(
-            ReadVarExpr { name: type_name, source_span: None },
-            &allocator,
-        )));
+        return crate::util::type_name_to_value_expr(allocator, &type_ref.type_name);
     }
 
     // For primitive types or other patterns, return None (invalid dependency)
@@ -504,7 +487,7 @@ pub struct StringConsts<'a> {
     /// diagnostic pass (`decorator_io_errors`) and the metadata extraction
     /// both evaluate it, and evaluation is deterministic.
     host_values: std::cell::RefCell<
-        HashMap<(usize, String), Result<std::vec::Vec<(Ident<'a>, Ident<'a>)>, String>>,
+        HashMap<(usize, String), Result<std::vec::Vec<(Ident<'a>, HostValue<'a>)>, String>>,
     >,
 }
 
@@ -1680,21 +1663,8 @@ pub fn param_decorator_errors<'a>(
         return std::vec::Vec::new();
     }
 
-    class
-        .body
-        .body
-        .iter()
-        .filter_map(|element| match element {
-            // Upstream picks the first constructor *with a body*
-            // (typescript.ts `findConstructorDeclaration`): an overload
-            // signature's parameters are not checked.
-            ClassElement::MethodDefinition(m)
-                if m.kind == MethodDefinitionKind::Constructor && m.value.body.is_some() =>
-            {
-                Some(m)
-            }
-            _ => None,
-        })
+    crate::util::find_constructor(class)
+        .into_iter()
         .flat_map(|ctor| ctor.value.params.items.iter())
         .flat_map(|param| param.decorators.iter())
         .filter(|d| super::is_angular_core_decorator(d, Some(consts)))
@@ -1955,6 +1925,31 @@ impl HostKey {
     }
 }
 
+/// A `host` metadata value: the string it evaluates to, or, for a plain
+/// attribute whose value ngtsc can't evaluate (its `DynamicValue`), the
+/// expression ngtsc emits in its place (`WrappedNodeExpr`), as it can be
+/// written where the metadata is compiled.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HostValue<'a> {
+    String(Ident<'a>),
+    Expression(&'a Expression<'a>),
+}
+
+impl<'a> HostValue<'a> {
+    /// The attribute value in `hostAttrs`: a string literal or the expression.
+    pub(crate) fn to_output(
+        self,
+        allocator: &'a Allocator,
+        source_text: Option<&'a str>,
+    ) -> Option<OutputExpression<'a>> {
+        match self {
+            Self::String(value) => Some(OutputAstBuilder::string(allocator, value)),
+            Self::Expression(expr) => convert_oxc_expression(allocator, expr, source_text)
+                .or_else(|| make_raw_source(allocator, source_text, expr.span())),
+        }
+    }
+}
+
 /// The entries of the `host` metadata `expr` evaluates to, in order, or the error ngtsc
 /// reports for it (on `expr`).
 ///
@@ -1972,7 +1967,7 @@ pub(crate) fn evaluate_host_metadata<'a>(
     expr: &'a Expression<'a>,
     decorator_name: &str,
     consts: &StringConsts<'a>,
-) -> Result<std::vec::Vec<(Ident<'a>, Ident<'a>)>, String> {
+) -> Result<std::vec::Vec<(Ident<'a>, HostValue<'a>)>, String> {
     // This runs twice per decorated class — the diagnostic checks it and the
     // metadata extraction reads the entries — so each `host:` expression is
     // evaluated once and the result shared (`StringConsts::host_values`).
@@ -1990,7 +1985,7 @@ fn evaluate_host_metadata_uncached<'a>(
     expr: &'a Expression<'a>,
     decorator_name: &str,
     consts: &StringConsts<'a>,
-) -> Result<std::vec::Vec<(Ident<'a>, Ident<'a>)>, String> {
+) -> Result<std::vec::Vec<(Ident<'a>, HostValue<'a>)>, String> {
     let subject = format!("@{decorator_name}.host");
     let host = Evaluator::new(consts).evaluate(expr);
     let Value::Object(props) = &host else {
@@ -2002,7 +1997,7 @@ fn evaluate_host_metadata_uncached<'a>(
     };
 
     let alloc = |s: &str| Ident::from(allocator.alloc_str(s));
-    let mut entries = std::vec::Vec::<(Ident<'a>, Ident<'a>)>::with_capacity(props.len());
+    let mut entries = std::vec::Vec::<(Ident<'a>, HostValue<'a>)>::with_capacity(props.len());
     // ngtsc reports unparseable values while building the host map, binding
     // kinds in `parseHostBindings` afterwards, and `verifyHostBindings` last:
     // the first error of an earlier step wins over every later one.
@@ -2018,29 +2013,48 @@ fn evaluate_host_metadata_uncached<'a>(
             continue;
         }
         // The value the key ends up with: its last one.
-        let value = host.prop(&prop.key).map_or(&prop.value, |p| &p.value);
-        let value = match value {
+        let last = host.prop(&prop.key).unwrap_or(prop);
+        let value = match &last.value {
             Value::Enum { value, .. } => value,
             value => value,
         };
+        // ngtsc's `DynamicValue`. So is a value computed from an import
+        // (`foo.bar()`), which ngtsc can't evaluate either when the other file
+        // has no readable value. An import named itself (`SHARED`, `ns.SHARED`)
+        // is a `Reference` ngtsc rejects ("found unparseable value"), and is
+        // reported as imported below.
+        let dynamic = value.is_dynamic()
+            || (value.is_import() && !last.origin.is_some_and(|o| consts.scope().names_import(o)))
+            || matches!(value, Value::Function(_));
         match value {
-            Value::String(s) => entries.push((alloc(&prop.key), alloc(s))),
-            // ngtsc's `DynamicValue`. `parseHostBindings` rejects it for everything but
-            // a plain attribute, whose expression it emits as it is written.
-            // Upstream throws these as bare `Error`s (a compiler crash, no
-            // node); here they surface as diagnostics on the host expression
-            // like the rest of `decorator_io_errors`.
-            _ if value.is_dynamic() || matches!(value, Value::Function(_)) => {
+            Value::String(s) => entries.push((alloc(&prop.key), HostValue::String(alloc(s)))),
+            // A plain attribute's dynamic value is emitted as it is written
+            // (`hostAttrs: ["role", make()]`).
+            _ if dynamic
+                && matches!(HostKey::of(&prop.key), HostKey::Attribute)
+                && let Some(origin) = last.origin =>
+            {
+                entries.push((alloc(&prop.key), HostValue::Expression(origin)));
+            }
+            // `parseHostBindings` rejects a dynamic value for everything but a
+            // plain attribute. Upstream throws these as bare `Error`s (a
+            // compiler crash, no node); here they surface as diagnostics on
+            // the host expression like the rest of `decorator_io_errors`.
+            _ if dynamic && !value.is_import() => {
                 if parse_error.is_none() {
                     parse_error = Some(match HostKey::of(&prop.key) {
                         HostKey::Property => "Property binding must be string".to_string(),
                         HostKey::Listener => "Event binding must be string".to_string(),
                         HostKey::Class => "Class binding must be string".to_string(),
                         HostKey::Style => "Style binding must be string".to_string(),
+                        // No expression to emit: it uses the parameters of
+                        // a function the metadata calls, or is written in
+                        // another file.
                         HostKey::Attribute => format!(
                             "Decorator host metadata must be a string -> string object, but the \
-                             value of '{}' could not be determined statically. OXC does not \
-                             support dynamic host attribute values.",
+                             value of '{}' could not be determined statically, and OXC can't \
+                             emit the expression it is written as where the metadata is \
+                             compiled.",
                             prop.key
                         ),
                     });
@@ -2110,6 +2124,7 @@ fn host_metadata_error<'a>(
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
+    source_text: Option<&'a str>,
     consts: &StringConsts<'a>,
 ) -> Option<R3HostMetadata<'a>> {
     // An unusable host is reported by `decorator_io_errors`.
@@ -2117,14 +2132,19 @@ fn extract_host_metadata<'a>(
 
     let mut host = R3HostMetadata::new(allocator);
     for (key, value) in entries {
-        match HostKey::of(key.as_str()) {
+        let kind = HostKey::of(key.as_str());
+        if matches!(kind, HostKey::Attribute) {
+            host.attributes.push((key, value.to_output(allocator, source_text)?));
+            continue;
+        }
+        // Only a plain attribute has an expression value.
+        let HostValue::String(value) = value else { continue };
+        match kind {
             HostKey::Property => host.properties.push((key, value)),
             HostKey::Listener => host.listeners.push((key, value)),
             HostKey::Class => host.class_attr = Some(value),
             HostKey::Style => host.style_attr = Some(value),
-            HostKey::Attribute => {
-                host.attributes.push((key, OutputAstBuilder::string(allocator, value)));
-            }
+            HostKey::Attribute => {}
         }
     }
     Some(host)

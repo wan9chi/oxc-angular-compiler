@@ -160,6 +160,15 @@ pub struct TransformOptions {
     /// >= v22, legacy when the version is unknown).
     pub legacy_optional_chaining: Option<bool>,
 
+    /// The `enableI18nLegacyMessageIdFormat` Angular compiler option
+    /// (`angularCompilerOptions.enableI18nLegacyMessageIdFormat` in `tsconfig.json`).
+    ///
+    /// When `true`, `$localize` messages carry their legacy ids
+    /// (`:@@custom␟<sha1>␟<decimal>:text`), for translation files keyed by legacy ids.
+    /// Defaults to `false`, as in the `tsconfig.json` that `ng new` generates.
+    #[napi(js_name = "enableI18nLegacyMessageIdFormat")]
+    pub enable_i18n_legacy_message_id_format: Option<bool>,
+
     // Component metadata fields for full compilation testing
     // These mirror Angular's @Component decorator options.
     /// The CSS selector that identifies this component in a template.
@@ -177,7 +186,8 @@ pub struct TransformOptions {
     /// Defaults to "Default" if not specified.
     pub change_detection: Option<String>,
 
-    /// Whether to preserve whitespace in templates.
+    /// Project-wide `preserveWhitespaces` (`angularCompilerOptions`): the
+    /// default for components whose decorator does not set it.
     /// Defaults to false if not specified.
     pub preserve_whitespaces: Option<bool>,
 
@@ -264,6 +274,9 @@ impl From<TransformOptions> for RustTransformOptions {
             i18n_use_external_ids: options.i18n_use_external_ids.unwrap_or(true),
             angular_version: options.angular_version.map(Into::into),
             legacy_optional_chaining: options.legacy_optional_chaining,
+            enable_i18n_legacy_message_id_format: options
+                .enable_i18n_legacy_message_id_format
+                .unwrap_or(false),
             // Component metadata overrides
             selector: options.selector,
             standalone: options.standalone,
@@ -1920,6 +1933,7 @@ pub fn extract_component_metadata_sync(
     source: String,
     file_path: String,
 ) -> Vec<ExtractedComponentMetadata> {
+    use oxc_angular_compiler::output::ast::{LiteralValue, OutputExpression};
     use oxc_angular_compiler::output::emitter::JsEmitter;
     use oxc_angular_compiler::{
         ChangeDetectionStrategy as RustChangeDetection, QueryPredicate,
@@ -1997,10 +2011,21 @@ pub fn extract_component_metadata_sync(
                         .iter()
                         .map(|(k, v)| vec![k.to_string(), v.to_string()])
                         .collect(),
+                    // A static attribute is its string; a dynamic one
+                    // (`role: make()`) is the expression `hostAttrs` emits.
                     attributes: h
                         .attributes
                         .iter()
-                        .map(|(k, v)| vec![k.to_string(), v.to_string()])
+                        .map(|(k, v)| {
+                            let value = match v {
+                                OutputExpression::Literal(lit) => match &lit.value {
+                                    LiteralValue::String(s) => s.to_string(),
+                                    _ => emitter.emit_expression(v),
+                                },
+                                _ => emitter.emit_expression(v),
+                            };
+                            vec![k.to_string(), value]
+                        })
                         .collect(),
                     listeners: h
                         .listeners
@@ -2178,7 +2203,7 @@ pub fn extract_component_metadata_sync(
                                 .join(","),
                         )
                     },
-                    preserve_whitespaces: metadata.preserve_whitespaces,
+                    preserve_whitespaces: metadata.preserve_whitespaces.unwrap_or(false),
                     providers,
                     view_providers,
                     animations,
@@ -3271,14 +3296,17 @@ pub struct BrowserTransformOptions {
 /// Result of `transformForBrowser`.
 #[napi(object)]
 pub struct BrowserTransformResult {
+    /// The transformed code; empty when there are errors.
     pub code: String,
+    /// Source map (if the `sourcemap` option was enabled).
     pub map: Option<String>,
-    pub errors: Vec<String>,
+    /// Parse and transform errors.
+    pub errors: Vec<OxcError>,
 }
 
-/// TypeScript stripped with Angular's settings (`experimentalDecorators`, `useDefineForClassFields: false`) and
-/// `async` lowered to generators, which zone.js needs; JavaScript gets only the lowering. Runtime helpers are
-/// imported from `@oxc-project/runtime`.
+/// TypeScript stripped as `tsc` does it with Angular's settings (`experimentalDecorators`,
+/// `useDefineForClassFields: false`, target ES2022) and `async` lowered to generators, which zone.js needs;
+/// JavaScript gets only the lowering. Runtime helpers are imported from `@oxc-project/runtime`.
 #[napi]
 pub fn transform_for_browser_sync(
     code: String,
@@ -3300,7 +3328,11 @@ pub fn transform_for_browser_sync(
             lower_async: options.lower_async.unwrap_or(true),
         },
     );
-    BrowserTransformResult { code: result.code, map: result.map, errors: result.errors }
+    BrowserTransformResult {
+        code: result.code,
+        map: result.map,
+        errors: OxcError::from_diagnostics(&filename, &code, result.errors),
+    }
 }
 
 pub struct TransformForBrowserTask {

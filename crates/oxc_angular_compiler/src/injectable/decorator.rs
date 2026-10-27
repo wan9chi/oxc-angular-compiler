@@ -5,8 +5,7 @@
 
 use oxc_allocator::{Allocator, Box, Vec};
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
-    MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
+    Argument, ArrayExpressionElement, Class, Decorator, Expression, ObjectPropertyKind, PropertyKey,
 };
 use oxc_span::Span;
 use oxc_str::Ident;
@@ -292,10 +291,10 @@ pub(crate) fn extract_injectable_metadata_in<'a>(
     let provided_in = extract_provided_in(allocator, config_obj, source_text);
 
     // Extract useClass
-    let use_class = extract_use_class(allocator, config_obj, source_text);
+    let use_class = extract_use_class(allocator, config_obj, source_text, consts);
 
     // Extract useFactory
-    let use_factory = extract_use_factory(allocator, config_obj, source_text);
+    let use_factory = extract_use_factory(allocator, config_obj, source_text, consts);
 
     // Extract useValue
     let use_value = extract_use_value(allocator, config_obj, source_text);
@@ -382,6 +381,7 @@ fn extract_use_class<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
     source_text: Option<&'a str>,
+    consts: Option<&StringConsts<'_>>,
 ) -> Option<UseClassMetadata<'a>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop
@@ -391,7 +391,7 @@ fn extract_use_class<'a>(
                 if key_name.as_str() == "useClass" {
                     let (class_expr, is_forward_ref) =
                         extract_forward_ref_or_expression(allocator, &prop.value, source_text)?;
-                    let deps = extract_deps_from_config(allocator, config_obj, source_text);
+                    let deps = extract_deps_from_config(allocator, config_obj, source_text, consts);
                     return Some(UseClassMetadata { class_expr, is_forward_ref, deps });
                 }
             }
@@ -404,6 +404,7 @@ fn extract_use_factory<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
     source_text: Option<&'a str>,
+    consts: Option<&StringConsts<'_>>,
 ) -> Option<UseFactoryMetadata<'a>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop
@@ -412,7 +413,7 @@ fn extract_use_factory<'a>(
             if let Some(key_name) = get_property_key_name(&prop.key) {
                 if key_name.as_str() == "useFactory" {
                     let factory = convert_oxc_expression(allocator, &prop.value, source_text)?;
-                    let deps = extract_deps_from_config(allocator, config_obj, source_text);
+                    let deps = extract_deps_from_config(allocator, config_obj, source_text, consts);
                     return Some(UseFactoryMetadata { factory, deps });
                 }
             }
@@ -492,6 +493,7 @@ fn extract_deps_from_config<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
     source_text: Option<&'a str>,
+    consts: Option<&StringConsts<'_>>,
 ) -> Vec<'a, DependencyMetadata<'a>> {
     let mut deps = Vec::new_in(&allocator);
 
@@ -503,7 +505,9 @@ fn extract_deps_from_config<'a>(
                 if key_name.as_str() == "deps" {
                     if let Expression::ArrayExpression(arr) = &prop.value {
                         for element in &arr.elements {
-                            if let Some(dep) = extract_dependency(allocator, element, source_text) {
+                            if let Some(dep) =
+                                extract_dependency(allocator, element, source_text, consts)
+                            {
                                 deps.push(dep);
                             }
                         }
@@ -517,24 +521,76 @@ fn extract_deps_from_config<'a>(
     deps
 }
 
+/// Angular's DI flags a `deps` array entry can hold, see [`extract_dependency`].
+const DEP_FLAGS: &[&str] = &["Inject", "Optional", "SkipSelf", "Self"];
+
+/// One `deps` entry, like ngtsc's `getDep`
+/// (`packages/compiler-cli/src/ngtsc/annotations/src/injectable.ts`): an array
+/// entry (`[new Optional(), new Self(), Dep]`) is a token plus flags, where
+/// `Inject`, `Optional`, `SkipSelf` and `Self` from `@angular/core` (bare or
+/// `new X()`) set the flags, `new Inject(T)` the token `T`, and any other
+/// element (the last one wins) the token.
 fn extract_dependency<'a>(
     allocator: &'a Allocator,
     element: &'a ArrayExpressionElement<'a>,
     source_text: Option<&'a str>,
+    consts: Option<&StringConsts<'_>>,
 ) -> Option<DependencyMetadata<'a>> {
-    match element {
-        ArrayExpressionElement::SpreadElement(_) | ArrayExpressionElement::Elision(_) => None,
-        _ => {
-            let expr = element.to_expression();
-            convert_oxc_expression(allocator, expr, source_text).map(|t| DependencyMetadata {
-                token: t,
-                optional: false,
-                self_: false,
-                skip_self: false,
-                host: false,
-            })
+    if matches!(
+        element,
+        ArrayExpressionElement::SpreadElement(_) | ArrayExpressionElement::Elision(_)
+    ) {
+        return None;
+    }
+    let expr = element.to_expression();
+    let mut dep = DependencyMetadata {
+        token: convert_oxc_expression(allocator, expr, source_text)?,
+        optional: false,
+        self_: false,
+        skip_self: false,
+        host: false,
+    };
+    let Expression::ArrayExpression(arr) = expr else { return Some(dep) };
+    for el in &arr.elements {
+        if matches!(
+            el,
+            ArrayExpressionElement::SpreadElement(_) | ArrayExpressionElement::Elision(_)
+        ) {
+            continue;
+        }
+        let el = el.to_expression();
+        let (flag, inject_token) = match el {
+            Expression::Identifier(id) => {
+                (crate::directive::angular_core_identifier(&id.name, consts, DEP_FLAGS), None)
+            }
+            Expression::NewExpression(new) => match &new.callee {
+                Expression::Identifier(id) => (
+                    crate::directive::angular_core_identifier(&id.name, consts, DEP_FLAGS),
+                    new.arguments.first().and_then(Argument::as_expression),
+                ),
+                _ => (None, None),
+            },
+            _ => (None, None),
+        };
+        match flag {
+            Some("Inject") => {
+                if let Some(token) = inject_token
+                    .and_then(|token| convert_oxc_expression(allocator, token, source_text))
+                {
+                    dep.token = token;
+                }
+            }
+            Some("Optional") => dep.optional = true,
+            Some("SkipSelf") => dep.skip_self = true,
+            Some("Self") => dep.self_ = true,
+            _ => {
+                if let Some(token) = convert_oxc_expression(allocator, el, source_text) {
+                    dep.token = token;
+                }
+            }
         }
     }
+    Some(dep)
 }
 
 /// Extract constructor dependencies from a class.
@@ -570,14 +626,7 @@ pub fn extract_constructor_deps<'a>(
     consts: Option<&StringConsts<'_>>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
-    let Some(constructor) = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    }) else {
+    let Some(constructor) = crate::util::find_constructor(class) else {
         // No constructor: a class with a superclass inherits its factory
         // (`None`), one without gets an implicit no-arg constructor.
         // See: packages/compiler-cli/src/ngtsc/annotations/common/src/di.ts:47-52
@@ -651,15 +700,18 @@ fn extract_param_dependency<'a>(
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
+        let name = OutputExpression::Literal(Box::new_in(
+            crate::output::ast::LiteralExpr {
+                value: crate::output::ast::LiteralValue::String(attr_name),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        // ngtsc's `attributeNameType` is the attribute name itself (di.ts), so it is
+        // set whatever the parameter's type and compiles to `ɵɵinjectAttribute`.
         return R3DependencyMetadata {
-            token: Some(OutputExpression::Literal(Box::new_in(
-                crate::output::ast::LiteralExpr {
-                    value: crate::output::ast::LiteralValue::String(attr_name),
-                    source_span: None,
-                },
-                &allocator,
-            ))),
-            attribute_name_type: token, // The type annotation
+            token: Some(name.clone_in(allocator)),
+            attribute_name_type: Some(name),
             host,
             optional,
             self_,
@@ -689,22 +741,9 @@ fn extract_param_token<'a>(
     // Narrow `T | null` unions to `T` to match the reference compiler.
     let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
-    // Handle TSTypeReference: SomeClass, SomeModule, etc.
+    // Handle TSTypeReference: `SomeClass`, or a qualified `ns.SomeClass`.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
-        // Get the type name
-        let type_name: Ident<'a> = match &type_ref.type_name {
-            oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.clone().into(),
-            oxc_ast::ast::TSTypeName::QualifiedName(_)
-            | oxc_ast::ast::TSTypeName::ThisExpression(_) => {
-                // Qualified names like Namespace.Type or 'this' type - not valid injection tokens
-                return None;
-            }
-        };
-
-        return Some(OutputExpression::ReadVar(Box::new_in(
-            ReadVarExpr { name: type_name, source_span: None },
-            &allocator,
-        )));
+        return crate::util::type_name_to_value_expr(allocator, &type_ref.type_name);
     }
 
     // For primitive types or other patterns, return None (invalid dependency)

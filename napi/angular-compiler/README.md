@@ -169,6 +169,7 @@ interface TransformOptions {
 
   // i18n (note the capital N, as the N-API bindings generate it)
   i18NUseExternalIds?: boolean
+  enableI18nLegacyMessageIdFormat?: boolean
 
   // Final component style output
   minifyComponentStyles?: boolean
@@ -178,6 +179,7 @@ interface TransformOptions {
   standalone?: boolean
   encapsulation?: 'Emulated' | 'None' | 'ShadowDom'
   changeDetection?: 'Default' | 'OnPush'
+  // Default for components that do not set their own (project-wide option)
   preserveWhitespaces?: boolean
 
   // Cross-file elision
@@ -221,6 +223,10 @@ interface PluginOptions {
 
   // Template hook, applied during both the initial build and HMR
   templateTransform?: (content: string, filePath: string) => string
+
+  // Project-wide default (`angularCompilerOptions.preserveWhitespaces`);
+  // a component's own `preserveWhitespaces` wins (default: false)
+  preserveWhitespaces?: boolean
 }
 ```
 
@@ -322,9 +328,11 @@ The Vite plugin consists of these sub-plugins:
 - External message IDs
 - File-based naming
 
-Not supported: legacy message IDs (Angular's `enableI18nLegacyMessageIdFormat`) and
-`i18nNormalizeLineEndingsInICUs`. `$localize` messages carry no legacy IDs, so translations
-keyed only by legacy IDs are not applied; translations keyed by the current message IDs are.
+- Legacy message IDs: `enableI18nLegacyMessageIdFormat: true` (also a Vite plugin option) makes
+  `$localize` messages carry them, for translation files keyed by legacy IDs. Off by default, as
+  in the `tsconfig.json` that `ng new` generates.
+
+Not supported: `i18nNormalizeLineEndingsInICUs`.
 
 ## Platform Support
 
