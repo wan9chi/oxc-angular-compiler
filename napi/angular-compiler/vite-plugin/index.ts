@@ -31,7 +31,7 @@ import {
   type AngularVersion,
 } from '#binding'
 
-import { asyncLoweringPlugin } from './angular-async-lowering-plugin.js'
+import { asyncDownlevelPlugin } from './angular-async-downlevel-plugin.js'
 import { buildOptimizerPlugin } from './angular-build-optimizer-plugin.js'
 import { jitPlugin } from './angular-jit-plugin.js'
 import { angularLinkerPlugin } from './angular-linker-plugin.js'
@@ -64,7 +64,7 @@ export interface PluginOptions {
    * Whether the app runs without zone.js.
    *
    * Unless it is zoneless, `async`/`await`, async generators and `for await` in
-   * application code are lowered to generators, as the Angular CLI does, so
+   * application code are downleveled to generators, as the Angular CLI does, so
    * zone.js can track them (`fakeAsync`/`tick()`, change detection after an
    * `await`). Server (SSR) transforms keep them native.
    *
@@ -1706,7 +1706,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
     ssrManifestPlugin({
       ssrEntry: options.ssrEntry,
     }),
-    asyncLoweringPlugin({
+    asyncDownlevelPlugin({
       zoneless: options.zoneless,
       sourcemap: pluginOptions.sourceMap,
     }),

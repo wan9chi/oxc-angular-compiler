@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,7 +10,7 @@ import { startVitest } from 'vitest/node'
 
 import { angular, type PluginOptions } from '../vite-plugin/index.js'
 
-const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), 'fixtures/lower-async')
+const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), 'fixtures/downlevel-async')
 
 const SOURCE = `export class A {
   b = 1;
@@ -25,7 +25,9 @@ const roots: string[] = []
 afterAll(() => roots.forEach((root) => rmSync(root, { recursive: true, force: true })))
 
 function tempRoot(withZoneJs: boolean): string {
-  const root = mkdtempSync(join(tmpdir(), 'oxc-angular-lower-async-'))
+  // realpath.native: the dev server only serves files under the real root, and
+  // Windows' temp dir can be an 8.3 short path (`RUNNER~1`).
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'oxc-angular-downlevel-async-')))
   roots.push(root)
   if (withZoneJs) {
     const zone = join(root, 'node_modules/zone.js')
@@ -41,7 +43,7 @@ async function transform(
   { root = tempRoot(false), ssr = false, id = '/src/a.ts', code = SOURCE } = {},
 ): Promise<string | undefined> {
   const plugin = angular({ liveReload: false, sourceMap: false, ...options }).find(
-    (candidate) => candidate.name === '@oxc-angular/vite-lower-async',
+    (candidate) => candidate.name === '@oxc-angular/vite-downlevel-async',
   ) as Plugin & { configResolved: (config: unknown) => void; transform: { handler: Function } }
   plugin.configResolved({ root })
   const result = await plugin.transform.handler.call(
@@ -57,8 +59,8 @@ async function transform(
   return result?.code
 }
 
-describe('async lowering for zone.js', () => {
-  it('lowers async functions, async generators and for await to generators', async () => {
+describe('async downleveling for zone.js', () => {
+  it('downlevels async functions, async generators and for await to generators', async () => {
     const code = await transform({ zoneless: false })
     expect(code).not.toMatch(/\basync\b|for await/)
     expect(code).toContain(
@@ -66,7 +68,7 @@ describe('async lowering for zone.js', () => {
     )
   })
 
-  it('only lowers async: the class field of the already-stripped TypeScript stays a field', async () => {
+  it('only downlevels async: the class field of the already-stripped TypeScript stays a field', async () => {
     const code = await transform({ zoneless: false })
     expect(code).toMatch(/^\s*b = 1;/m)
     expect(code).not.toContain('this.b')
@@ -78,13 +80,13 @@ describe('async lowering for zone.js', () => {
     expect(code).not.toContain('require(')
   })
 
-  it('reports a lowering error by its message', async () => {
+  it('reports a downleveling error by its message', async () => {
     await expect(
       transform({ zoneless: false }, { id: '/src/a.js', code: 'async function f( {' }),
     ).rejects.toThrow('Expected `}` but found `EOF`')
   })
 
-  it('lowers before import analysis, so the dev server resolves the helper import', async () => {
+  it('downlevels before import analysis, so the dev server resolves the helper import', async () => {
     const root = tempRoot(false)
     mkdirSync(join(root, 'src'))
     writeFileSync(
@@ -115,7 +117,7 @@ describe('async lowering for zone.js', () => {
     expect(await transform({ zoneless: false }, { ssr: true })).toBeUndefined()
   })
 
-  it('defaults to lowering when zone.js resolves from the root, and to native otherwise', async () => {
+  it('defaults to downleveling when zone.js resolves from the root, and to native otherwise', async () => {
     expect(await transform({}, { root: tempRoot(true) })).toContain('_asyncToGenerator')
     expect(await transform({}, { root: tempRoot(false) })).toBeUndefined()
   })

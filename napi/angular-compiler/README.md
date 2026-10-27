@@ -241,7 +241,7 @@ For `"auto"`, the plugin uses `build.cssMinify` when it is set, otherwise it fal
 ### zone.js and `async`/`await`
 
 zone.js cannot track native `await`. Unless the app is zoneless, the plugin
-lowers `async` functions, async generators and `for await` in application code
+downlevels `async` functions, async generators and `for await` in application code
 to generators, as the Angular CLI does for apps with `zone.js` in their
 polyfills, so `fakeAsync` with `tick()`/`flushMicrotasks()` drives code that
 awaits, and change detection runs after an `await`. The helpers are imported
@@ -252,7 +252,7 @@ SSR, so run zone.js specs in `jsdom`, `happy-dom` or the browser.
 Without `zoneless`, an app is taken to be zoneless when no `node_modules` above
 the Vite root contains `zone.js`. Set `zoneless: true` to keep `async` native in a
 zoneless app that still has zone.js installed, or `zoneless: false` to force the
-lowering.
+downleveling.
 
 ### Library builds (`.d.ts`)
 

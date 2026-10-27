@@ -11,7 +11,7 @@ const JSX_EXT_REGEX = /\.[jt]sx$/
 const SCRIPT_EXT_REGEX = /\.m?[jt]s$/
 
 /**
- * Lowers `async` functions, async generators and `for await` to generators in
+ * Downlevels `async` functions, async generators and `for await` to generators in
  * application code when the app runs zone.js, as the Angular CLI does
  * (esbuild `supported: { 'async-await': false }` unless the app is zoneless).
  * zone.js cannot patch native `await`, so without this `fakeAsync`/`tick()`
@@ -21,25 +21,25 @@ const SCRIPT_EXT_REGEX = /\.m?[jt]s$/
  * Helpers are imported from `@oxc-project/runtime`, which Vite resolves itself.
  * Server transforms are left native.
  */
-export function asyncLoweringPlugin({
+export function asyncDownlevelPlugin({
   zoneless,
   sourcemap,
 }: {
   zoneless: boolean | undefined
   sourcemap: boolean
 }): Plugin {
-  let lowerAsync = false
+  let downlevelAsync = false
 
   return {
-    name: '@oxc-angular/vite-lower-async',
-    // After TypeScript is stripped, and after Vitest hoists `vi.mock()`: lowered
+    name: '@oxc-angular/vite-downlevel-async',
+    // After TypeScript is stripped, and after Vitest hoists `vi.mock()`: downleveled
     // earlier, an async mock factory becomes an eager `_asyncToGenerator(...)` call
     // that the hoisting would move above the helper's import. A plugin-level
     // `post`, not a hook-level one, so it still runs before `vite:import-analysis`,
     // which resolves the helper imports for the dev server.
     enforce: 'post',
     configResolved(config) {
-      lowerAsync = !(zoneless ?? !isZoneJsInstalled(config.root))
+      downlevelAsync = !(zoneless ?? !isZoneJsInstalled(config.root))
     },
     transform: {
       filter: {
@@ -47,7 +47,7 @@ export function asyncLoweringPlugin({
         code: /\basync\b/,
       },
       async handler(code, id, options) {
-        if (!lowerAsync || options?.ssr) return
+        if (!downlevelAsync || options?.ssr) return
 
         // The code is JavaScript by now: name it so, or it would be stripped as
         // TypeScript a second time, under Angular's class-field semantics. `.mjs`,
@@ -57,7 +57,10 @@ export function asyncLoweringPlugin({
         const filename = JSX_EXT_REGEX.test(id)
           ? id.replace(JSX_EXT_REGEX, '.jsx')
           : id.replace(SCRIPT_EXT_REGEX, '.mjs')
-        const result = await transformForBrowser(code, filename, { lowerAsync: true, sourcemap })
+        const result = await transformForBrowser(code, filename, {
+          downlevelAsync: true,
+          sourcemap,
+        })
         if (result.errors.length > 0) {
           this.error(result.errors.map((error) => error.message).join('\n'))
         }
