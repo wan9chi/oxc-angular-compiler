@@ -5445,39 +5445,6 @@ fn html_parse_error_diagnostic(
 /// entry refers to, by local name, when `@defer` may lazy-load it.
 type DeferrableSelector<'f> = &'f dyn Fn(&str) -> Option<String>;
 
-/// The class an `imports` entry names: `X`, or `forwardRef(() => X)` when
-/// the decorator analysis resolved it through `@angular/core`'s `forwardRef`
-/// (`forward_refs`), like ngtsc's `forwardRefResolver`.
-fn import_entry_class<'a>(
-    entry: &OutputExpression<'a>,
-    forward_refs: &[Ident<'a>],
-) -> Option<Ident<'a>> {
-    let read_var = |expr: &OutputExpression<'a>| match expr {
-        OutputExpression::ReadVar(var) => Some(var.name),
-        _ => None,
-    };
-    if let Some(name) = read_var(entry) {
-        return Some(name);
-    }
-    let OutputExpression::InvokeFunction(call) = entry else { return None };
-    let statements = match call.args.as_slice() {
-        [OutputExpression::ArrowFunction(arrow)] => match &arrow.body {
-            ArrowFunctionBody::Expression(body) => {
-                return read_var(body).filter(|name| forward_refs.contains(name));
-            }
-            ArrowFunctionBody::Statements(statements) => statements,
-        },
-        [OutputExpression::Function(function)] => &function.statements,
-        _ => return None,
-    };
-    match statements.as_slice() {
-        [OutputStatement::Return(ret)] => {
-            read_var(&ret.value).filter(|name| forward_refs.contains(name))
-        }
-        _ => None,
-    }
-}
-
 fn compile_component_full<'a>(
     allocator: &'a Allocator,
     template: &'a str,
@@ -5669,15 +5636,19 @@ fn compile_component_full<'a>(
         && let Some(import_elision) = import_elision
         && !options.hmr
         && let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports
-        && let Some(entry_classes) = raw_imports
+        && raw_imports.entries.len() == metadata.import_entry_classes.len()
+        && raw_imports
             .entries
             .iter()
-            .map(|entry| import_entry_class(entry, &metadata.forward_ref_imports))
-            .collect::<Option<std::vec::Vec<_>>>()
+            .zip(&metadata.import_entry_classes)
+            .all(|(entry, class)| class.is_some() || matches!(entry, OutputExpression::ReadVar(_)))
         && super::defer_resolver::template_has_defer_block(&r3_result.nodes)
     {
-        let candidates: Vec<_> = entry_classes
-            .into_iter()
+        let candidates: Vec<_> = metadata
+            .import_entry_classes
+            .iter()
+            .flatten()
+            .copied()
             .filter_map(|name| {
                 let selector = deferrable_selector(name.as_str())?;
                 Some((name, crate::pipeline::selector::CssSelector::parse(&selector)))
@@ -5704,9 +5675,9 @@ fn compile_component_full<'a>(
             let is_deferred = |name: &str| deferred.iter().any(|d| d.as_str() == name);
             metadata.imports.retain(|name| !is_deferred(name.as_str()));
             if let Some(OutputExpression::LiteralArray(raw_imports)) = &mut metadata.raw_imports {
-                let forward_refs = &metadata.forward_ref_imports;
-                raw_imports.entries.retain(|entry| {
-                    !import_entry_class(entry, forward_refs).is_some_and(|name| is_deferred(&name))
+                let mut classes = metadata.import_entry_classes.iter();
+                raw_imports.entries.retain(|_| {
+                    !classes.next().copied().flatten().is_some_and(|name| is_deferred(&name))
                 });
             }
             implicitly_deferred_imports = deferred.iter().map(ToString::to_string).collect();

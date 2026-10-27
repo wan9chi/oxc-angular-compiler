@@ -180,8 +180,8 @@ pub fn extract_component_metadata<'a>(
                     // For standalone components, we need:
                     // 1. The identifier list for local analysis
                     metadata.imports = extract_identifier_array(allocator, &prop.value);
-                    metadata.forward_ref_imports =
-                        extract_forward_ref_array(allocator, &prop.value, consts);
+                    metadata.import_entry_classes =
+                        extract_import_entry_classes(allocator, &prop.value, consts);
                     // 2. The raw expression to pass to ɵɵgetComponentDepsFactory in RuntimeResolved mode
                     metadata.raw_imports =
                         convert_oxc_expression(allocator, &prop.value, source_text);
@@ -491,20 +491,23 @@ fn extract_identifier_array<'a>(
     result
 }
 
-/// The classes an array literal names as `forwardRef(() => X)`, with
-/// `@angular/core`'s `forwardRef`.
-fn extract_forward_ref_array<'a>(
+/// The class each element of an array literal names, by position: `X`, or
+/// `forwardRef(() => X)` with `@angular/core`'s `forwardRef`.
+fn extract_import_entry_classes<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
     consts: &StringConsts<'_>,
-) -> Vec<'a, Ident<'a>> {
+) -> Vec<'a, Option<Ident<'a>>> {
     let mut result = Vec::new_in(&allocator);
     if let Expression::ArrayExpression(arr) = expr {
-        for element in arr.elements.iter().filter_map(ArrayExpressionElement::as_expression) {
-            if let Some(Expression::Identifier(id)) = try_unwrap_forward_ref(element, Some(consts))
-            {
-                result.push(id.name);
-            }
+        for element in &arr.elements {
+            let class = element.as_expression().and_then(|element| {
+                match try_unwrap_forward_ref(element, Some(consts)).unwrap_or(element) {
+                    Expression::Identifier(id) => Some(id.name),
+                    _ => None,
+                }
+            });
+            result.push(class);
         }
     }
     result
