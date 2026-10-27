@@ -22,7 +22,7 @@ use super::metadata::{
 };
 use super::property_decorators::try_unwrap_forward_ref;
 use crate::factory::R3DependencyMetadata;
-use crate::output::ast::{OutputAstBuilder, OutputExpression, ReadVarExpr};
+use crate::output::ast::{OutputAstBuilder, OutputExpression};
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::r3::CORE;
 use crate::util::is_metadata_property;
@@ -300,14 +300,7 @@ fn extract_constructor_deps<'a>(
     consts: &StringConsts<'a>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
-    let constructor = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    });
+    let constructor = crate::util::find_constructor(class);
 
     match constructor {
         Some(ctor) => {
@@ -387,15 +380,18 @@ fn extract_param_dependency<'a>(
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
+        let name = OutputExpression::Literal(Box::new_in(
+            crate::output::ast::LiteralExpr {
+                value: crate::output::ast::LiteralValue::String(attr_name),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        // ngtsc's `attributeNameType` is the attribute name itself (di.ts), so it is
+        // set whatever the parameter's type and compiles to `ɵɵinjectAttribute`.
         return R3DependencyMetadata {
-            token: Some(OutputExpression::Literal(Box::new_in(
-                crate::output::ast::LiteralExpr {
-                    value: crate::output::ast::LiteralValue::String(attr_name),
-                    source_span: None,
-                },
-                &allocator,
-            ))),
-            attribute_name_type: token, // The type annotation
+            token: Some(name.clone_in(allocator)),
+            attribute_name_type: Some(name),
             host,
             optional,
             self_,
@@ -430,22 +426,9 @@ fn extract_param_token<'a>(
     // Narrow `T | null` unions to `T` to match the reference compiler.
     let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
-    // Handle TSTypeReference: SomeClass, SomeModule, etc.
+    // Handle TSTypeReference: `SomeClass`, or a qualified `ns.SomeClass`.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
-        // Get the type name
-        let type_name = match &type_ref.type_name {
-            oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.clone().into(),
-            oxc_ast::ast::TSTypeName::QualifiedName(_)
-            | oxc_ast::ast::TSTypeName::ThisExpression(_) => {
-                // Qualified names like Namespace.Type or 'this' type - not valid injection tokens
-                return None;
-            }
-        };
-
-        return Some(OutputExpression::ReadVar(Box::new_in(
-            ReadVarExpr { name: type_name, source_span: None },
-            &allocator,
-        )));
+        return crate::util::type_name_to_value_expr(allocator, &type_ref.type_name);
     }
 
     // For primitive types or other patterns, return None (invalid dependency)
@@ -1680,21 +1663,8 @@ pub fn param_decorator_errors<'a>(
         return std::vec::Vec::new();
     }
 
-    class
-        .body
-        .body
-        .iter()
-        .filter_map(|element| match element {
-            // Upstream picks the first constructor *with a body*
-            // (typescript.ts `findConstructorDeclaration`): an overload
-            // signature's parameters are not checked.
-            ClassElement::MethodDefinition(m)
-                if m.kind == MethodDefinitionKind::Constructor && m.value.body.is_some() =>
-            {
-                Some(m)
-            }
-            _ => None,
-        })
+    crate::util::find_constructor(class)
+        .into_iter()
         .flat_map(|ctor| ctor.value.params.items.iter())
         .flat_map(|param| param.decorators.iter())
         .filter(|d| super::is_angular_core_decorator(d, Some(consts)))
