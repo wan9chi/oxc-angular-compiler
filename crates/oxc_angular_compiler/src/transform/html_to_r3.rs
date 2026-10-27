@@ -62,6 +62,38 @@ const EVENT_END: char = ')';
 /// Template attribute prefix for structural directives.
 const TEMPLATE_ATTR_PREFIX: char = '*';
 
+/// The prefix of a legacy animation property: `[animate-x]`, `bind-animate-x`.
+/// Reference: binding_parser.ts line 48 (`LEGACY_ANIMATE_PROP_PREFIX`)
+const LEGACY_ANIMATE_PROP_PREFIX: &str = "animate-";
+
+/// The key span of a binding: `identifier`, which starts `prefix` into the attribute.
+/// For `[user]="x"` it is `user`, for `(click)="f()"` it is `click`.
+/// Reference: r3_template_transform.ts lines 751-757 (`createKeySpan` in `parseAttribute`)
+fn create_key_span(attr: &HtmlAttribute<'_>, prefix: &str, identifier: &str) -> Span {
+    let start = attr.span.start + prefix.len() as u32;
+    Span::new(start, start + identifier.len() as u32)
+}
+
+/// The key span of a property binding named `name` (the identifier `parseAttribute` passes
+/// to `parsePropertyBinding`): a legacy animation's `animate-` or `@` is not part of it.
+/// Reference: binding_parser.ts lines 365-386 (`parsePropertyBinding`)
+fn property_binding_key_span(name: &str, key_span: Span) -> Span {
+    if name.starts_with(LEGACY_ANIMATE_PROP_PREFIX) {
+        Span::new(key_span.start + LEGACY_ANIMATE_PROP_PREFIX.len() as u32, key_span.end)
+    } else if name.starts_with('@') {
+        Span::new(key_span.start + 1, key_span.end)
+    } else {
+        key_span
+    }
+}
+
+/// The key span of an event named `name` (the identifier `parseAttribute` passes to
+/// `parseEvent`): a legacy animation event's `@` is not part of it.
+/// Reference: binding_parser.ts lines 660-667 (`parseEvent`)
+fn event_key_span(name: &str, key_span: Span) -> Span {
+    if name.starts_with('@') { Span::new(key_span.start + 1, key_span.end) } else { key_span }
+}
+
 /// Tags that cannot be used as selectorless component tags.
 /// These are special HTML or Angular elements that have reserved semantics.
 const UNSUPPORTED_SELECTORLESS_TAGS: &[&str] =
@@ -106,6 +138,9 @@ pub struct TransformOptions {
     pub collect_comment_nodes: bool,
     /// Angular version being compiled. `None` uses the latest (v22) security schema.
     pub angular_version: Option<AngularVersion>,
+    /// Angular's `enableI18nLegacyMessageIdFormat`: give each i18n message its legacy ids
+    /// (`computeDigest`, `computeDecimalDigest`), which `$localize` metadata then carries.
+    pub enable_i18n_legacy_message_id_format: bool,
 }
 
 /// Inserts or updates a var entry in an ordered Vec, preserving first-insertion order.
@@ -185,6 +220,14 @@ pub struct HtmlToR3Transform<'a> {
     icu_names: IcuPlaceholderNames,
     /// Full names (`:svg:svg`) of the enclosing elements, for i18n placeholder names.
     element_full_names: std::vec::Vec<String>,
+    /// Whether i18n messages get legacy ids (`enableI18nLegacyMessageIdFormat`).
+    legacy_message_ids: bool,
+    /// The children of each element as parsed, before whitespace removal, keyed by the
+    /// element's start offset. Angular computes legacy ids on the untrimmed template.
+    untrimmed_children: FxHashMap<u32, &'a [HtmlNode<'a>]>,
+    /// Whether an ICU visited now is a direct child of an i18n element's message (Angular's
+    /// `currentMessage` in `I18nMetaVisitor.visitExpansion`), not inside a nested element.
+    in_i18n_message: bool,
     /// The template as a source file for i18n messages, built on first use and shared by
     /// every message so the template text is copied once.
     i18n_source_file: std::cell::OnceCell<std::sync::Arc<crate::util::ParseSourceFile>>,
@@ -241,8 +284,47 @@ impl<'a> HtmlToR3Transform<'a> {
             message_names: MessagePlaceholderNames::default(),
             icu_names: IcuPlaceholderNames::default(),
             element_full_names: std::vec::Vec::new(),
+            legacy_message_ids: options.enable_i18n_legacy_message_id_format,
+            untrimmed_children: FxHashMap::default(),
+            in_i18n_message: false,
             i18n_source_file: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Gives the transformer the template as parsed, before whitespace removal: legacy message
+    /// ids are computed on it, as Angular's first `I18nMetaVisitor` pass does.
+    #[must_use]
+    pub fn with_untrimmed_nodes(mut self, nodes: &'a [HtmlNode<'a>]) -> Self {
+        fn index<'a>(map: &mut FxHashMap<u32, &'a [HtmlNode<'a>]>, nodes: &'a [HtmlNode<'a>]) {
+            for node in nodes {
+                match node {
+                    HtmlNode::Element(element) => {
+                        map.insert(element.span.start, &element.children);
+                        index(map, &element.children);
+                    }
+                    HtmlNode::Component(component) => index(map, &component.children),
+                    HtmlNode::Block(block) => index(map, &block.children),
+                    _ => {}
+                }
+            }
+        }
+        if self.legacy_message_ids {
+            index(&mut self.untrimmed_children, nodes);
+        }
+        self
+    }
+
+    /// Angular's `_setLegacyIds`: `[computeDigest(message), computeDecimalDigest(message)]`.
+    fn legacy_ids(&self, message: &crate::i18n::ast::Message) -> Vec<'a, Ident<'a>> {
+        let mut ids = Vec::new_in(&self.allocator);
+        if self.legacy_message_ids {
+            ids.push(Ident::from_in(crate::i18n::compute_digest(message).as_str(), self.allocator));
+            ids.push(Ident::from_in(
+                crate::i18n::compute_decimal_digest(message).as_str(),
+                self.allocator,
+            ));
+        }
+        ids
     }
 
     /// Returns the template source file that i18n messages point into.
@@ -500,41 +582,61 @@ impl<'a> HtmlToR3Transform<'a> {
         // Generate i18n message string from HTML children BEFORE transforming to R3.
         // This is needed because the message text comes from the original HTML content.
         // Ported from Angular's I18nMetaVisitor._generateI18nMessage in i18n/meta.ts.
-        let i18n_message_string = if let Some(attr) = i18n_attr {
+        let (i18n_message_string, legacy_ids) = if let Some(attr) = i18n_attr {
             if element.children.is_empty() {
-                String::new()
+                (String::new(), Vec::new_in(&self.allocator))
             } else {
                 // Use I18nMessageFactory to convert children to i18n AST and serialize
                 let factory = I18nMessageFactory::new(false, true);
                 let source_file = self.i18n_source_file();
                 let meta = parse_i18n_meta(attr.value.as_str());
+                let element_name = self.element_i18n_name(&resolved_name, host_tag.as_deref());
 
                 let message = factory.create_message(
                     &element.children,
-                    Some(self.element_i18n_name(&resolved_name, host_tag.as_deref())),
+                    Some(element_name),
                     Some(meta.meaning),
                     Some(meta.description),
                     Some(meta.custom_id),
                     None,
-                    source_file,
+                    std::sync::Arc::clone(&source_file),
                 );
                 collect_placeholder_names(&message.nodes, &mut self.message_names);
-                message.serialize()
+                // Legacy ids are computed before whitespace removal.
+                let legacy_ids = match self.untrimmed_children.get(&element.span.start) {
+                    Some(children) if self.legacy_message_ids => {
+                        self.legacy_ids(&factory.create_message(
+                            children,
+                            Some(element_name),
+                            Some(meta.meaning),
+                            Some(meta.description),
+                            Some(meta.custom_id),
+                            None,
+                            source_file,
+                        ))
+                    }
+                    _ => self.legacy_ids(&message),
+                };
+                (message.serialize(), legacy_ids)
             }
         } else {
-            String::new()
+            (String::new(), Vec::new_in(&self.allocator))
         };
 
         // Now create the i18n metadata with the generated message string
         let i18n_meta = if let Some(attr) = i18n_attr {
             // Element has its own i18n attribute - parse it as a Message with message string
             let instance_id = self.allocate_i18n_message_instance_id();
-            Some(parse_i18n_meta_with_message(
+            let mut meta = parse_i18n_meta_with_message(
                 &self.allocator,
                 attr.value.as_str(),
                 instance_id,
                 &i18n_message_string,
-            ))
+            );
+            if let I18nMeta::Message(message) = &mut meta {
+                message.legacy_ids = legacy_ids;
+            }
+            Some(meta)
         } else if self.i18n_depth > 0 {
             // Element is inside an i18n block - create a TagPlaceholder for it.
             // This matches TypeScript's behavior where child elements inside i18n blocks
@@ -569,7 +671,9 @@ impl<'a> HtmlToR3Transform<'a> {
         // Visit children
         self.element_full_names
             .push(self.element_i18n_name(&resolved_name, host_tag.as_deref()).to_string());
+        let in_i18n_message = std::mem::replace(&mut self.in_i18n_message, has_i18n);
         let children = self.visit_children(&element.children);
+        self.in_i18n_message = in_i18n_message;
         self.element_full_names.pop();
         // Consumed by the ICU child, if any; do not leak it to a later ICU.
         self.sole_icu_message = None;
@@ -817,7 +921,9 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         // Visit children
+        let in_i18n_message = std::mem::replace(&mut self.in_i18n_message, has_i18n);
         let children = self.visit_children(&component.children);
+        self.in_i18n_message = in_i18n_message;
 
         // Decrement non_bindable depth if we incremented it
         if has_non_bindable {
@@ -1060,6 +1166,12 @@ impl<'a> HtmlToR3Transform<'a> {
                 if attr_name.starts_with('#') || attr_name.starts_with("ref-") {
                     let ref_name =
                         if attr_name.starts_with('#') { &attr_name[1..] } else { &attr_name[4..] };
+                    // Reference: r3_template_transform.ts line 789
+                    let key_span = create_key_span(
+                        attr,
+                        &attr_name[..attr_name.len() - ref_name.len()],
+                        ref_name,
+                    );
 
                     // Validate reference - no value allowed in directive context
                     // Reference: r3_template_transform.ts lines 1121-1140
@@ -1081,7 +1193,7 @@ impl<'a> HtmlToR3Transform<'a> {
                             name: Ident::from_in(ref_name, &self.allocator),
                             value: Ident::from_in("", &self.allocator),
                             source_span: attr.span,
-                            key_span: attr.name_span,
+                            key_span,
                             value_span: None,
                         });
                     }
@@ -1090,6 +1202,10 @@ impl<'a> HtmlToR3Transform<'a> {
 
                 // Check for binding prefix syntax (bind-, on-, bindon-)
                 if let Some((prefix, rest)) = self.parse_binding_prefix(attr_name) {
+                    // Reference: r3_template_transform.ts lines 765-811 (`createKeySpan(srcSpan,
+                    // bindParts[KW_*_IDX], identifier)`)
+                    let key_span =
+                        create_key_span(attr, &attr_name[..attr_name.len() - rest.len()], rest);
                     match prefix {
                         BindingPrefix::Bind => {
                             // bind-prop="value" - property binding
@@ -1126,7 +1242,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 value: parse_result.ast,
                                 unit: None,
                                 source_span: attr.span,
-                                key_span: attr.name_span,
+                                key_span: property_binding_key_span(rest, key_span),
                                 value_span: Some(value_span),
                                 i18n: None,
                                 security_context: self.security_context(element_name, prop_name),
@@ -1145,7 +1261,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 event_type: ParsedEventType::Regular,
                                 phase: None,
                                 source_span: attr.span,
-                                key_span: attr.name_span,
+                                key_span: event_key_span(rest, key_span),
                                 handler_span: value_span,
                             });
                         }
@@ -1161,7 +1277,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 value: parse_result.ast,
                                 unit: None,
                                 source_span: attr.span,
-                                key_span: attr.name_span,
+                                key_span: property_binding_key_span(rest, key_span),
                                 value_span: Some(value_span),
                                 i18n: None,
                                 security_context: self.security_context(element_name, rest),
@@ -1174,13 +1290,13 @@ impl<'a> HtmlToR3Transform<'a> {
                                 self.binding_parser.parse_event(attr_value, value_span);
 
                             outputs.push(R3BoundEvent {
+                                key_span: event_key_span(&event_name, key_span),
                                 name: event_name,
                                 handler: event_parse_result.ast,
                                 target: None,
                                 event_type: ParsedEventType::TwoWay,
                                 phase: None,
                                 source_span: attr.span,
-                                key_span: attr.name_span,
                                 handler_span: value_span,
                             });
                         }
@@ -1200,7 +1316,9 @@ impl<'a> HtmlToR3Transform<'a> {
                                 value: parse_result.ast,
                                 unit: None,
                                 source_span: attr.span,
-                                key_span: attr.name_span,
+                                // `parseLiteralAttr` drops the `@` from the key span.
+                                // Reference: binding_parser.ts lines 308-314
+                                key_span: create_key_span(attr, "@", rest),
                                 value_span: Some(value_span),
                                 i18n: None,
                                 security_context: crate::ast::r3::SecurityContext::None,
@@ -1217,6 +1335,8 @@ impl<'a> HtmlToR3Transform<'a> {
                 if attr_name.starts_with("[(") && attr_name.ends_with(")]") {
                     // Two-way binding: [(prop)]="value" - allowed
                     let prop_name = &attr_name[2..attr_name.len() - 2];
+                    // Reference: r3_template_transform.ts line 871
+                    let key_span = create_key_span(attr, BANANA_BOX_START, prop_name);
                     let value_str = self.allocator.alloc_str(attr_value);
                     let value_span = attr.value_span.unwrap_or(attr.span);
                     let parse_result = self.binding_parser.parse_binding(value_str, value_span);
@@ -1227,7 +1347,7 @@ impl<'a> HtmlToR3Transform<'a> {
                         value: parse_result.ast,
                         unit: None,
                         source_span: attr.span,
-                        key_span: attr.name_span,
+                        key_span: property_binding_key_span(prop_name, key_span),
                         value_span: Some(value_span),
                         i18n: None,
                         security_context: self.security_context(element_name, prop_name),
@@ -1240,13 +1360,13 @@ impl<'a> HtmlToR3Transform<'a> {
                         self.binding_parser.parse_event(event_value_str, value_span);
 
                     outputs.push(R3BoundEvent {
+                        key_span: event_key_span(&event_name, key_span),
                         name: event_name,
                         handler: event_parse_result.ast,
                         target: None,
                         event_type: ParsedEventType::TwoWay,
                         phase: None,
                         source_span: attr.span,
-                        key_span: attr.name_span,
                         handler_span: value_span,
                     });
                 } else if attr_name.starts_with('[') && attr_name.ends_with(']') {
@@ -1298,7 +1418,11 @@ impl<'a> HtmlToR3Transform<'a> {
                         value: parse_result.ast,
                         unit: None,
                         source_span: attr.span,
-                        key_span: attr.name_span,
+                        // Reference: r3_template_transform.ts line 871
+                        key_span: property_binding_key_span(
+                            prop_name,
+                            create_key_span(attr, "[", prop_name),
+                        ),
                         value_span: Some(value_span),
                         i18n: None,
                         security_context: self.security_context(element_name, prop_name),
@@ -1306,11 +1430,14 @@ impl<'a> HtmlToR3Transform<'a> {
                 } else if attr_name.starts_with('(') && attr_name.ends_with(')') {
                     // Event binding: (event)="handler"
                     let event_name = &attr_name[1..attr_name.len() - 1];
+                    // Reference: r3_template_transform.ts line 871
+                    let key_span =
+                        event_key_span(event_name, create_key_span(attr, "(", event_name));
 
                     // Check for legacy animation syntax (@) or (@name.phase)
                     if event_name.starts_with('@') {
                         let anim_name = event_name.strip_prefix('@').unwrap_or("");
-                        outputs.push(self.create_legacy_animation_event(anim_name, attr));
+                        outputs.push(self.create_legacy_animation_event(anim_name, attr, key_span));
                     } else {
                         // Regular event handling
                         let value_str = self.allocator.alloc_str(attr_value);
@@ -1324,7 +1451,7 @@ impl<'a> HtmlToR3Transform<'a> {
                             event_type: ParsedEventType::Regular,
                             phase: None,
                             source_span: attr.span,
-                            key_span: attr.name_span,
+                            key_span,
                             handler_span: value_span,
                         });
                     }
@@ -1430,7 +1557,7 @@ impl<'a> HtmlToR3Transform<'a> {
         // child of an i18n element shares that element's message, so it is the message rather
         // than a sub-message of it.
         let source_file = self.i18n_source_file();
-        let icu_message = I18nMessageFactory::new(false, true).create_icu_message(
+        let mut icu_message = I18nMessageFactory::new(false, true).create_icu_message(
             expansion,
             self.element_full_names.last().map(String::as_str),
             source_file,
@@ -1441,6 +1568,16 @@ impl<'a> HtmlToR3Transform<'a> {
             &crate::i18n::ast::serialize_message_for_id(&icu_message.nodes),
             "",
         );
+        let (meta_value, instance_id, is_sub_message) = match self.sole_icu_message.take() {
+            Some((meta_value, instance_id)) => (meta_value, instance_id, false),
+            None => (String::new(), self.allocate_i18n_message_instance_id(), true),
+        };
+        // Whitespace removal leaves an ICU's content as is, so its legacy ids are those of the
+        // first pass. A sole ICU is its element's message and takes the element's meaning.
+        if !is_sub_message {
+            icu_message.meaning = parse_i18n_meta(&meta_value).meaning.to_string();
+        }
+        let legacy_ids = self.legacy_ids(&icu_message);
         // Angular builds the ICU's placeholders from the message's placeholders: `VAR_*` become
         // vars, interpolations become bound text, and element markup becomes plain text.
         let (vars, others): (std::vec::Vec<_>, std::vec::Vec<_>) =
@@ -1456,19 +1593,20 @@ impl<'a> HtmlToR3Transform<'a> {
             .map(|(name, placeholder)| (placeholder.text, name))
             .collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        let (meta_value, instance_id, is_sub_message) = match self.sole_icu_message.take() {
-            Some((meta_value, instance_id)) => (meta_value, instance_id, false),
-            None => (String::new(), self.allocate_i18n_message_instance_id(), true),
-        };
         let I18nMeta::Message(mut i18n_message) =
             parse_i18n_meta_with_message(self.allocator, &meta_value, instance_id, &message_string)
         else {
             unreachable!("parse_i18n_meta_with_message always returns a Message")
         };
-        if is_sub_message {
+        // Angular's `serializeI18nTemplatePart` names the sub-message on the parent's ICU
+        // placeholder only when the sub-message has no legacy ids. The parent's
+        // `placeholderToMessage` holds the meta visitor's message, with legacy ids, only for
+        // an ICU visited with the i18n element's message as `currentMessage`.
+        if is_sub_message && (legacy_ids.is_empty() || !self.in_i18n_message) {
             i18n_message.associated_message_id =
                 Ident::from_in(associated_message_id.as_str(), self.allocator);
         }
+        i18n_message.legacy_ids = legacy_ids;
 
         // The pipeline identifies the ICU by a message holding a single IcuPlaceholder.
         let icu_type_upper = expansion.expansion_type.as_str().to_uppercase();
@@ -3187,7 +3325,8 @@ impl<'a> HtmlToR3Transform<'a> {
                     continue;
                 };
                 let instance_id = self.allocate_i18n_message_instance_id();
-                let (message_string, nodes) = self.create_attribute_i18n_message(target);
+                let (message_string, nodes, mut legacy_message) =
+                    self.create_attribute_i18n_message(target);
                 let mut meta = parse_i18n_meta_with_message(
                     self.allocator,
                     attr.value.as_str(),
@@ -3196,6 +3335,8 @@ impl<'a> HtmlToR3Transform<'a> {
                 );
                 if let I18nMeta::Message(message) = &mut meta {
                     message.nodes = nodes;
+                    legacy_message.meaning = message.meaning.to_string();
+                    message.legacy_ids = self.legacy_ids(&legacy_message);
                 }
                 i18n_attrs_meta.insert(target_attr, meta);
             }
@@ -3251,9 +3392,14 @@ impl<'a> HtmlToR3Transform<'a> {
 
             // Check for binding prefixes (normalization already applied to name)
             if let Some((prefix, rest)) = self.parse_binding_prefix(name) {
+                // The key span covers the identifier after the keyword prefix.
+                // Reference: r3_template_transform.ts lines 765-811 (`createKeySpan(srcSpan,
+                // bindParts[KW_*_IDX], identifier)`)
+                let key_span = create_key_span(attr, &name[..name.len() - rest.len()], rest);
                 match prefix {
                     BindingPrefix::Bind => {
                         // Check for animation bindings: bind-@prop or bind-animate-prop
+                        let key_span = property_binding_key_span(rest, key_span);
                         if let Some(anim_name) = rest.strip_prefix('@') {
                             inputs.push(self.create_bound_attribute(
                                 element_name,
@@ -3261,6 +3407,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 attr,
                                 BindingType::Animation,
                                 None,
+                                key_span,
                             ));
                         } else if let Some(anim_name) = rest.strip_prefix("animate-") {
                             inputs.push(self.create_bound_attribute(
@@ -3269,6 +3416,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 attr,
                                 BindingType::Animation,
                                 None,
+                                key_span,
                             ));
                         } else {
                             let i18n = i18n_attrs_meta.remove(rest);
@@ -3278,6 +3426,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 attr,
                                 BindingType::Property,
                                 None,
+                                key_span,
                             );
                             bound_attr.i18n = i18n;
                             inputs.push(bound_attr);
@@ -3286,7 +3435,8 @@ impl<'a> HtmlToR3Transform<'a> {
                     BindingPrefix::Let => {
                         if is_template {
                             // Validate and create variable
-                            if let Some(var) = self.create_validated_variable(rest, attr) {
+                            if let Some(var) = self.create_validated_variable(rest, attr, key_span)
+                            {
                                 variables.push(var);
                             }
                         } else {
@@ -3300,13 +3450,17 @@ impl<'a> HtmlToR3Transform<'a> {
                     BindingPrefix::Ref => {
                         // Validate and create reference (with duplicate detection)
                         if let Some(reference) =
-                            self.create_validated_reference(rest, attr, &references)
+                            self.create_validated_reference(rest, attr, key_span, &references)
                         {
                             references.push(reference);
                         }
                     }
                     BindingPrefix::On => {
-                        outputs.push(self.create_bound_event(rest, attr));
+                        outputs.push(self.create_bound_event(
+                            rest,
+                            attr,
+                            event_key_span(rest, key_span),
+                        ));
                     }
                     BindingPrefix::BindOn => {
                         // Two-way binding creates both input and output
@@ -3316,10 +3470,12 @@ impl<'a> HtmlToR3Transform<'a> {
                             attr,
                             BindingType::TwoWay,
                             None,
+                            property_binding_key_span(rest, key_span),
                         ));
                         // Create the output event (propChange)
                         let event_name = format!("{rest}Change");
-                        outputs.push(self.create_two_way_event(&event_name, attr));
+                        let event_key = event_key_span(&event_name, key_span);
+                        outputs.push(self.create_two_way_event(&event_name, attr, event_key));
                     }
                     BindingPrefix::At => {
                         // Legacy animation trigger syntax (@prop)
@@ -3332,10 +3488,15 @@ impl<'a> HtmlToR3Transform<'a> {
                         }
                         // Still create as a legacy animation input for error recovery
                         // Use create_legacy_animation_attribute to default empty values to "undefined"
+                        // `parseLiteralAttr` takes the key span of the whole name and drops the
+                        // `@`. Reference: r3_template_transform.ts line 836, binding_parser.ts
+                        // lines 308-314
+                        let key_span = create_key_span(attr, "@", rest);
                         inputs.push(self.create_legacy_animation_attribute(
                             element_name,
                             rest,
                             attr,
+                            key_span,
                         ));
                     }
                 }
@@ -3345,6 +3506,9 @@ impl<'a> HtmlToR3Transform<'a> {
             // Check for banana-in-a-box [(prop)]
             if name.starts_with(BANANA_BOX_START) && name.ends_with(BANANA_BOX_END) {
                 let prop_name = &name[2..name.len() - 2];
+                // Reference: r3_template_transform.ts line 871 (`createKeySpan(srcSpan,
+                // delims.start, identifier)`)
+                let key_span = create_key_span(attr, BANANA_BOX_START, prop_name);
                 // Two-way binding creates both input and output
                 inputs.push(self.create_bound_attribute(
                     element_name,
@@ -3352,16 +3516,22 @@ impl<'a> HtmlToR3Transform<'a> {
                     attr,
                     BindingType::TwoWay,
                     None,
+                    property_binding_key_span(prop_name, key_span),
                 ));
                 // Create the output event (propChange)
                 let event_name = format!("{prop_name}Change");
-                outputs.push(self.create_two_way_event(&event_name, attr));
+                let event_key = event_key_span(&event_name, key_span);
+                outputs.push(self.create_two_way_event(&event_name, attr, event_key));
                 continue;
             }
 
             // Check for property binding [prop]
             if name.starts_with(PROPERTY_START) && name.ends_with(PROPERTY_END) {
                 let prop_name = &name[1..name.len() - 1];
+                // Reference: r3_template_transform.ts line 871 (`createKeySpan(srcSpan,
+                // delims.start, identifier)`)
+                let key_span =
+                    property_binding_key_span(prop_name, create_key_span(attr, "[", prop_name));
                 let (binding_type, final_name, unit) =
                     if let Some(stripped) = prop_name.strip_prefix("attr.") {
                         (BindingType::Attribute, stripped, None)
@@ -3389,8 +3559,14 @@ impl<'a> HtmlToR3Transform<'a> {
                 // Look up i18n metadata for this property binding (e.g., i18n-heading for [heading])
                 // Ported from Angular's categorizePropertyAttributes in r3_template_transform.ts
                 let i18n = i18n_attrs_meta.remove(final_name);
-                let mut bound_attr =
-                    self.create_bound_attribute(element_name, final_name, attr, binding_type, unit);
+                let mut bound_attr = self.create_bound_attribute(
+                    element_name,
+                    final_name,
+                    attr,
+                    binding_type,
+                    unit,
+                    key_span,
+                );
                 bound_attr.i18n = i18n;
                 inputs.push(bound_attr);
                 continue;
@@ -3399,21 +3575,27 @@ impl<'a> HtmlToR3Transform<'a> {
             // Check for event binding (event)
             if name.starts_with(EVENT_START) && name.ends_with(EVENT_END) {
                 let event_name = &name[1..name.len() - 1];
+                // Reference: r3_template_transform.ts line 871 (`createKeySpan(srcSpan,
+                // delims.start, identifier)`)
+                let key_span = event_key_span(event_name, create_key_span(attr, "(", event_name));
                 // Check for legacy animation syntax (@) or (@name)
                 if event_name.starts_with('@') {
                     let anim_name = event_name.strip_prefix('@').unwrap_or("");
-                    outputs.push(self.create_legacy_animation_event(anim_name, attr));
+                    outputs.push(self.create_legacy_animation_event(anim_name, attr, key_span));
                 } else {
-                    outputs.push(self.create_bound_event_with_target(event_name, attr));
+                    outputs.push(self.create_bound_event_with_target(event_name, attr, key_span));
                 }
                 continue;
             }
 
             // Check for reference #ref
             if name.starts_with('#') {
-                if let Some(reference) =
-                    self.create_validated_reference(&name[1..], attr, &references)
-                {
+                if let Some(reference) = self.create_validated_reference(
+                    &name[1..],
+                    attr,
+                    create_key_span(attr, "#", &name[1..]),
+                    &references,
+                ) {
                     references.push(reference);
                 }
                 continue;
@@ -3448,13 +3630,14 @@ impl<'a> HtmlToR3Transform<'a> {
 
     /// Builds the i18n message for a translated attribute from the attribute's value.
     ///
-    /// Returns the serialized message and its top-level nodes. An attribute message only
-    /// contains text and interpolation placeholders; the placeholder nodes give ingest the
-    /// names Angular reads from `Object.keys(message.placeholders)`.
+    /// Returns the serialized message, its top-level nodes and the message itself (for its
+    /// legacy ids). An attribute message only contains text and interpolation placeholders;
+    /// the placeholder nodes give ingest the names Angular reads from
+    /// `Object.keys(message.placeholders)`.
     fn create_attribute_i18n_message(
         &self,
         attr: &HtmlAttribute<'a>,
-    ) -> (String, Vec<'a, I18nNode<'a>>) {
+    ) -> (String, Vec<'a, I18nNode<'a>>, crate::i18n::ast::Message) {
         let message = I18nMessageFactory::new(false, true)
             .create_attribute_message(attr, self.i18n_source_file());
         let span = |s: &crate::util::ParseSourceSpan| Span::new(s.start.offset, s.end.offset);
@@ -3481,7 +3664,7 @@ impl<'a> HtmlToR3Transform<'a> {
                 node => push(node),
             }
         }
-        (message.serialize(), nodes)
+        (message.serialize(), nodes, message)
     }
 
     /// Normalizes an attribute name by stripping the data- prefix (case-insensitive).
@@ -3522,6 +3705,7 @@ impl<'a> HtmlToR3Transform<'a> {
         attr: &HtmlAttribute<'a>,
         binding_type: BindingType,
         unit: Option<&str>,
+        key_span: Span,
     ) -> R3BoundAttribute<'a> {
         let value_span = attr.value_span.unwrap_or(attr.span);
         let value = self.parse_binding_expression(&attr.value, value_span);
@@ -3537,7 +3721,7 @@ impl<'a> HtmlToR3Transform<'a> {
             value,
             unit: unit.map(|u| Ident::from(self.allocator.alloc_str(u))),
             source_span: attr.span,
-            key_span: attr.name_span,
+            key_span,
             value_span: attr.value_span,
             i18n: None,
         }
@@ -3568,6 +3752,7 @@ impl<'a> HtmlToR3Transform<'a> {
         _element_name: &str,
         property_name: &str,
         attr: &HtmlAttribute<'a>,
+        key_span: Span,
     ) -> R3BoundAttribute<'a> {
         let value_span = attr.value_span.unwrap_or(attr.span);
         // For legacy animation triggers, parse "undefined" when there's no expression.
@@ -3589,7 +3774,7 @@ impl<'a> HtmlToR3Transform<'a> {
             value: result.ast,
             unit: None,
             source_span: attr.span,
-            key_span: attr.name_span,
+            key_span,
             value_span: attr.value_span,
             i18n: None,
         }
@@ -3602,6 +3787,7 @@ impl<'a> HtmlToR3Transform<'a> {
         &mut self,
         name: &str,
         attr: &HtmlAttribute<'a>,
+        key_span: Span,
     ) -> R3BoundEvent<'a> {
         let handler_span = self.calculate_event_handler_span(attr);
         let handler = self.parse_event_expression(&attr.value, handler_span);
@@ -3632,12 +3818,17 @@ impl<'a> HtmlToR3Transform<'a> {
             phase: None,
             source_span: attr.span,
             handler_span,
-            key_span: attr.name_span,
+            key_span,
         }
     }
 
     /// Creates a bound event (without target parsing).
-    fn create_bound_event(&mut self, name: &str, attr: &HtmlAttribute<'a>) -> R3BoundEvent<'a> {
+    fn create_bound_event(
+        &mut self,
+        name: &str,
+        attr: &HtmlAttribute<'a>,
+        key_span: Span,
+    ) -> R3BoundEvent<'a> {
         let handler_span = self.calculate_event_handler_span(attr);
         let handler = self.parse_event_expression(&attr.value, handler_span);
         let name_atom = Ident::from(self.allocator.alloc_str(name));
@@ -3656,7 +3847,7 @@ impl<'a> HtmlToR3Transform<'a> {
             phase: None,
             source_span: attr.span,
             handler_span,
-            key_span: attr.name_span,
+            key_span,
         }
     }
 
@@ -3671,6 +3862,7 @@ impl<'a> HtmlToR3Transform<'a> {
         &mut self,
         name: &str,
         attr: &HtmlAttribute<'a>,
+        key_span: Span,
     ) -> R3BoundEvent<'a> {
         let handler_span = self.calculate_event_handler_span(attr);
         let handler = self.parse_event_expression(&attr.value, handler_span);
@@ -3700,14 +3892,19 @@ impl<'a> HtmlToR3Transform<'a> {
             phase,
             source_span: attr.span,
             handler_span,
-            key_span: attr.name_span,
+            key_span,
         }
     }
 
     /// Creates a bound event for two-way binding.
     /// The handler is just the target expression (e.g., `name`), not the full assignment.
     /// The `$event` is added separately in the ingest phase.
-    fn create_two_way_event(&mut self, name: &str, attr: &HtmlAttribute<'a>) -> R3BoundEvent<'a> {
+    fn create_two_way_event(
+        &mut self,
+        name: &str,
+        attr: &HtmlAttribute<'a>,
+        key_span: Span,
+    ) -> R3BoundEvent<'a> {
         let handler_span = self.calculate_event_handler_span(attr);
         let name_atom = Ident::from(self.allocator.alloc_str(name));
 
@@ -3724,7 +3921,7 @@ impl<'a> HtmlToR3Transform<'a> {
             phase: None,
             source_span: attr.span,
             handler_span,
-            key_span: attr.name_span,
+            key_span,
         }
     }
 
@@ -3770,6 +3967,7 @@ impl<'a> HtmlToR3Transform<'a> {
         &mut self,
         name: &str,
         attr: &HtmlAttribute<'a>,
+        key_span: Span,
     ) -> Option<R3Variable<'a>> {
         // Validate variable name
         if name.contains('-') {
@@ -3784,7 +3982,7 @@ impl<'a> HtmlToR3Transform<'a> {
             name: name_atom,
             value: attr.value,
             source_span: attr.span,
-            key_span: attr.name_span,
+            key_span,
             value_span: attr.value_span,
         })
     }
@@ -3795,6 +3993,7 @@ impl<'a> HtmlToR3Transform<'a> {
         &mut self,
         name: &str,
         attr: &HtmlAttribute<'a>,
+        key_span: Span,
         existing_refs: &Vec<'a, R3Reference<'a>>,
     ) -> Option<R3Reference<'a>> {
         // Validate reference name
@@ -3815,7 +4014,7 @@ impl<'a> HtmlToR3Transform<'a> {
             name: name_atom,
             value: attr.value,
             source_span: attr.span,
-            key_span: attr.name_span,
+            key_span,
             value_span: attr.value_span,
         })
     }
@@ -4935,7 +5134,8 @@ impl<'a> HtmlToR3Transform<'a> {
             value: expr,
             unit: unit.map(|u| Ident::from(self.allocator.alloc_str(u))),
             source_span: attr.span,
-            key_span: attr.name_span,
+            // Reference: r3_template_transform.ts line 927 (`createKeySpan(srcSpan, '', name)`)
+            key_span: create_key_span(attr, "", name),
             value_span: attr.value_span,
             i18n,
         }
@@ -5525,9 +5725,17 @@ mod security_tests {
             "{contexts:?}"
         );
 
-        // A namespaced host does not fall back to the bare iframe sink.
-        let (_, contexts, _) =
-            compile_selectorless(r#"<MyComp:svg:iframe [src]="url"></MyComp:svg:iframe>"#);
+        // A namespaced host falls back to the bare iframe sink from 22.0.2;
+        // before that the `:svg:iframe|src` miss has no sanitizer.
+        let source = r#"<MyComp:svg:iframe [src]="url"></MyComp:svg:iframe>"#;
+        let (_, contexts, _) = compile_selectorless(source);
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "src" && *ctx == SecurityContext::ResourceUrl),
+            "{contexts:?}"
+        );
+        let (_, contexts, _) = compile_selectorless_at(source, Some(AngularVersion::new(22, 0, 1)));
         assert!(
             contexts.iter().all(|(name, ctx)| name != "src" || *ctx == SecurityContext::None),
             "{contexts:?}"
@@ -5599,11 +5807,19 @@ mod security_tests {
         );
 
         // `<MyComp>` inside `<svg>` resolves to `:svg:ng-component`, so its
-        // children stay namespaced.
-        let (_, contexts, _) =
-            compile_selectorless(r#"<svg><MyComp><iframe [src]="url"></iframe></MyComp></svg>"#);
+        // children stay namespaced: `:svg:iframe|src` only hits the HTML
+        // `iframe|src` key through the 22.0.2+ fallback.
+        let source = r#"<svg><MyComp><iframe [src]="url"></iframe></MyComp></svg>"#;
+        let (_, contexts, _) = compile_selectorless_at(source, Some(AngularVersion::new(22, 0, 1)));
         assert!(
             contexts.iter().all(|(name, ctx)| name != "src" || *ctx == SecurityContext::None),
+            "{contexts:?}"
+        );
+        let (_, contexts, _) = compile_selectorless(source);
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "src" && *ctx == SecurityContext::ResourceUrl),
             "{contexts:?}"
         );
 
@@ -5787,6 +6003,227 @@ mod template_parser_tests {
         assert_eq!(
             errors,
             ["Blank expressions are not allowed in interpolated strings at column 2 in [a {{ }}]"]
+        );
+    }
+}
+
+/// Key spans, ported from Angular's `test/render3/r3_ast_spans_spec.ts`: the key span of a binding
+/// is its identifier, without the binding syntax around it.
+#[cfg(test)]
+mod key_span_tests {
+    use super::*;
+    use crate::parser::html::HtmlParser;
+    use oxc_allocator::Allocator;
+
+    type Keys = std::vec::Vec<(&'static str, String)>;
+
+    /// `(node kind, key span text)` for every attribute, binding, reference and variable.
+    fn key_spans(source: &str) -> Keys {
+        let allocator = Allocator::default();
+        let parsed = HtmlParser::new(&allocator, source, "test.html").parse();
+        let result =
+            html_ast_to_r3_ast(&allocator, source, &parsed.nodes, TransformOptions::default());
+        let mut out = Keys::new();
+        walk(source, &result.nodes, &mut out);
+        out
+    }
+
+    fn text(source: &str, span: Span) -> String {
+        source[span.start as usize..span.end as usize].to_string()
+    }
+
+    fn push_attrs(
+        source: &str,
+        out: &mut Keys,
+        attributes: &[R3TextAttribute<'_>],
+        inputs: &[R3BoundAttribute<'_>],
+        outputs: &[R3BoundEvent<'_>],
+        references: &[R3Reference<'_>],
+    ) {
+        for attr in attributes {
+            out.push(("TextAttribute", attr.key_span.map(|s| text(source, s)).unwrap_or_default()));
+        }
+        for input in inputs {
+            out.push(("BoundAttribute", text(source, input.key_span)));
+        }
+        for output in outputs {
+            out.push(("BoundEvent", text(source, output.key_span)));
+        }
+        for reference in references {
+            out.push(("Reference", text(source, reference.key_span)));
+        }
+    }
+
+    fn walk(source: &str, nodes: &[R3Node<'_>], out: &mut Keys) {
+        for node in nodes {
+            match node {
+                R3Node::Element(el) => {
+                    push_attrs(
+                        source,
+                        out,
+                        &el.attributes,
+                        &el.inputs,
+                        &el.outputs,
+                        &el.references,
+                    );
+                    walk(source, &el.children, out);
+                }
+                R3Node::Template(tpl) => {
+                    for attr in &tpl.template_attrs {
+                        match attr {
+                            R3TemplateAttr::Text(attr) => out.push((
+                                "TextAttribute",
+                                attr.key_span.map(|s| text(source, s)).unwrap_or_default(),
+                            )),
+                            R3TemplateAttr::Bound(input) => {
+                                out.push(("BoundAttribute", text(source, input.key_span)));
+                            }
+                        }
+                    }
+                    for variable in &tpl.variables {
+                        out.push(("Variable", text(source, variable.key_span)));
+                    }
+                    // A `*` template's own attributes are hoisted from the element it wraps,
+                    // which reports them itself.
+                    if tpl.template_attrs.is_empty() {
+                        push_attrs(
+                            source,
+                            out,
+                            &tpl.attributes,
+                            &tpl.inputs,
+                            &tpl.outputs,
+                            &tpl.references,
+                        );
+                    }
+                    walk(source, &tpl.children, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn pairs(expected: &[(&'static str, &str)]) -> Keys {
+        expected.iter().map(|(kind, key)| (*kind, (*key).to_string())).collect()
+    }
+
+    #[test]
+    fn bound_attribute() {
+        assert_eq!(
+            key_spans(r#"<div [someProp]="v"></div>"#),
+            pairs(&[("BoundAttribute", "someProp")])
+        );
+        assert_eq!(key_spans("<div [someProp]></div>"), pairs(&[("BoundAttribute", "someProp")]));
+        // `attr.`, `class.` and `style.` stay in the key span: `parseAttribute` does not split them.
+        assert_eq!(
+            key_spans(r#"<div [attr.role]="r" [class.on]="c" [style.width.px]="w"></div>"#),
+            pairs(&[
+                ("BoundAttribute", "attr.role"),
+                ("BoundAttribute", "class.on"),
+                ("BoundAttribute", "style.width.px"),
+            ])
+        );
+        assert_eq!(
+            key_spans(r#"<div [@trigger]="v"></div>"#),
+            pairs(&[("BoundAttribute", "trigger")])
+        );
+    }
+
+    #[test]
+    fn bind_prefix() {
+        assert_eq!(key_spans(r#"<div bind-prop="v"></div>"#), pairs(&[("BoundAttribute", "prop")]));
+        assert_eq!(
+            key_spans(r#"<div bind-@animation="v"></div>"#),
+            pairs(&[("BoundAttribute", "animation")])
+        );
+        assert_eq!(
+            key_spans(r#"<div bind-animate-animationName="v"></div>"#),
+            pairs(&[("BoundAttribute", "animationName")])
+        );
+        assert_eq!(key_spans("<div @animation></div>"), pairs(&[("BoundAttribute", "animation")]));
+    }
+
+    #[test]
+    fn interpolated_attribute() {
+        assert_eq!(key_spans(r#"<div prop="{{v}}"></div>"#), pairs(&[("BoundAttribute", "prop")]));
+        assert_eq!(
+            key_spans(r#"<div data-prop="{{v}}"></div>"#),
+            pairs(&[("BoundAttribute", "data-prop")])
+        );
+        // The parser names a namespaced attribute `:xlink:href`, one byte longer than its source,
+        // and Angular measures the key span by that name, so it takes in the `=` (as Angular 22.2.2).
+        assert_eq!(
+            key_spans(r#"<svg><use xlink:href="{{url}}"/></svg>"#),
+            pairs(&[("BoundAttribute", "xlink:href=")])
+        );
+    }
+
+    #[test]
+    fn event() {
+        assert_eq!(
+            key_spans(r#"<div (someEvent)="v"></div>"#),
+            pairs(&[("BoundEvent", "someEvent")])
+        );
+        assert_eq!(key_spans(r#"<div on-event="v"></div>"#), pairs(&[("BoundEvent", "event")]));
+        assert_eq!(
+            key_spans(r#"<div (window:resize)="v"></div>"#),
+            pairs(&[("BoundEvent", "window:resize")])
+        );
+        assert_eq!(
+            key_spans(r#"<div (@name.done)="v"></div>"#),
+            pairs(&[("BoundEvent", "name.done")])
+        );
+        assert_eq!(
+            key_spans(r#"<div data-on-event="v"></div>"#),
+            pairs(&[("TextAttribute", "data-on-event")])
+        );
+    }
+
+    #[test]
+    fn two_way_binding() {
+        assert_eq!(
+            key_spans(r#"<div [(prop)]="v"></div>"#),
+            pairs(&[("BoundAttribute", "prop"), ("BoundEvent", "prop")])
+        );
+        assert_eq!(
+            key_spans(r#"<div bindon-prop="v"></div>"#),
+            pairs(&[("BoundAttribute", "prop"), ("BoundEvent", "prop")])
+        );
+    }
+
+    #[test]
+    fn references_and_variables() {
+        assert_eq!(key_spans("<div #a></div>"), pairs(&[("Reference", "a")]));
+        assert_eq!(key_spans(r#"<div #a="b"></div>"#), pairs(&[("Reference", "a")]));
+        assert_eq!(key_spans("<div ref-a></div>"), pairs(&[("Reference", "a")]));
+        assert_eq!(
+            key_spans(r#"<ng-template let-a="b"></ng-template>"#),
+            pairs(&[("Variable", "a")])
+        );
+    }
+
+    #[test]
+    fn template_attribute() {
+        assert_eq!(key_spans("<div *ngIf></div>"), pairs(&[("TextAttribute", "ngIf")]));
+        assert_eq!(
+            key_spans(r#"<div *ngFor="let item of items; trackBy: trackByFn"></div>"#),
+            pairs(&[
+                ("TextAttribute", "ngFor"),
+                ("BoundAttribute", "of"),
+                ("BoundAttribute", "trackBy"),
+                ("Variable", "item"),
+            ])
+        );
+        assert_eq!(
+            key_spans(r#"<div *ngFor="item of items"></div>"#),
+            pairs(&[("BoundAttribute", "ngFor"), ("BoundAttribute", "of")])
+        );
+        assert_eq!(
+            key_spans(r#"<div *ngIf="expr as local"></div>"#),
+            pairs(&[("BoundAttribute", "ngIf"), ("Variable", "local")])
+        );
+        assert_eq!(
+            key_spans(r#"<div *ngIf="let a=b"></div>"#),
+            pairs(&[("TextAttribute", "ngIf"), ("Variable", "a")])
         );
     }
 }
