@@ -7,7 +7,8 @@ import type { Plugin } from 'vite'
 
 // Application scripts. `.cjs`/`.cts` are left out: the runtime helpers are ES imports.
 const SCRIPT_REGEX = /\.(?:[jt]sx?|m[jt]s)$/
-const TS_EXT_REGEX = /\.([cm]?)ts(x?)$/
+const JSX_EXT_REGEX = /\.[jt]sx$/
+const SCRIPT_EXT_REGEX = /\.m?[jt]s$/
 
 /**
  * Lowers `async` functions, async generators and `for await` to generators in
@@ -31,14 +32,16 @@ export function asyncLoweringPlugin({
 
   return {
     name: '@oxc-angular/vite-lower-async',
+    // After TypeScript is stripped, and after Vitest hoists `vi.mock()`: lowered
+    // earlier, an async mock factory becomes an eager `_asyncToGenerator(...)` call
+    // that the hoisting would move above the helper's import. A plugin-level
+    // `post`, not a hook-level one, so it still runs before `vite:import-analysis`,
+    // which resolves the helper imports for the dev server.
+    enforce: 'post',
     configResolved(config) {
       lowerAsync = !(zoneless ?? !isZoneJsInstalled(config.root))
     },
     transform: {
-      // After TypeScript is stripped, and after Vitest hoists `vi.mock()`: lowered
-      // earlier, an async mock factory becomes an eager `_asyncToGenerator(...)` call
-      // that the hoisting would move above the helper's import.
-      order: 'post',
       filter: {
         id: { include: SCRIPT_REGEX, exclude: /node_modules/ },
         code: /\basync\b/,
@@ -47,13 +50,16 @@ export function asyncLoweringPlugin({
         if (!lowerAsync || options?.ssr) return
 
         // The code is JavaScript by now: name it so, or it would be stripped as
-        // TypeScript a second time, under Angular's class-field semantics.
-        const result = await transformForBrowser(code, id.replace(TS_EXT_REGEX, '.$1js$2'), {
-          lowerAsync: true,
-          sourcemap,
-        })
+        // TypeScript a second time, under Angular's class-field semantics. `.mjs`,
+        // because Vite serves it as a module: as `.js`, a file without `import` or
+        // `export` would get its helpers through `require()`. `.jsx` keeps parsing
+        // JSX that Vite was told to preserve.
+        const filename = JSX_EXT_REGEX.test(id)
+          ? id.replace(JSX_EXT_REGEX, '.jsx')
+          : id.replace(SCRIPT_EXT_REGEX, '.mjs')
+        const result = await transformForBrowser(code, filename, { lowerAsync: true, sourcemap })
         if (result.errors.length > 0) {
-          this.error(result.errors.join('\n'))
+          this.error(result.errors.map((error) => error.message).join('\n'))
         }
         return { code: result.code, map: result.map ?? null }
       },

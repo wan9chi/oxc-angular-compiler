@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import type { Plugin } from 'vite'
+import { createServer } from 'vite'
 import { afterAll, describe, expect, it } from 'vitest'
 import { startVitest } from 'vitest/node'
 
@@ -37,7 +38,7 @@ function tempRoot(withZoneJs: boolean): string {
 
 async function transform(
   options: PluginOptions,
-  { root = tempRoot(false), ssr = false, id = '/src/a.ts' } = {},
+  { root = tempRoot(false), ssr = false, id = '/src/a.ts', code = SOURCE } = {},
 ): Promise<string | undefined> {
   const plugin = angular({ liveReload: false, sourceMap: false, ...options }).find(
     (candidate) => candidate.name === '@oxc-angular/vite-lower-async',
@@ -49,7 +50,7 @@ async function transform(
         throw new Error(message)
       },
     },
-    SOURCE,
+    code,
     id,
     { ssr },
   )
@@ -69,6 +70,41 @@ describe('async lowering for zone.js', () => {
     const code = await transform({ zoneless: false })
     expect(code).toMatch(/^\s*b = 1;/m)
     expect(code).not.toContain('this.b')
+  })
+
+  it('imports the helpers as a module in a file without import or export', async () => {
+    const code = await transform({ zoneless: false }, { code: 'async function f() {}\nf();\n' })
+    expect(code).toContain('import _asyncToGenerator from')
+    expect(code).not.toContain('require(')
+  })
+
+  it('reports a lowering error by its message', async () => {
+    await expect(
+      transform({ zoneless: false }, { id: '/src/a.js', code: 'async function f( {' }),
+    ).rejects.toThrow('Expected `}` but found `EOF`')
+  })
+
+  it('lowers before import analysis, so the dev server resolves the helper import', async () => {
+    const root = tempRoot(false)
+    mkdirSync(join(root, 'src'))
+    writeFileSync(
+      join(root, 'src/main.ts'),
+      'export async function f(): Promise<number> {\n  return 1\n}\n',
+    )
+    const server = await createServer({
+      root,
+      configFile: false,
+      logLevel: 'silent',
+      server: { middlewareMode: true, ws: false },
+      plugins: [angular({ zoneless: false, liveReload: false })],
+    })
+    try {
+      const result = await server.transformRequest('/src/main.ts')
+      expect(result?.code).toContain('_asyncToGenerator')
+      expect(result?.code).not.toContain('from "@oxc-project/runtime')
+    } finally {
+      await server.close()
+    }
   })
 
   it('keeps async native when zoneless', async () => {

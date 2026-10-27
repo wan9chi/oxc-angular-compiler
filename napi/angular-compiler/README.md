@@ -246,7 +246,8 @@ to generators, as the Angular CLI does for apps with `zone.js` in their
 polyfills, so `fakeAsync` with `tick()`/`flushMicrotasks()` drives code that
 awaits, and change detection runs after an `await`. The helpers are imported
 from `@oxc-project/runtime`, which Vite resolves. Server (SSR) transforms and
-`node_modules` are left as they are.
+`node_modules` are left as they are. Vitest's `node` environment transforms as
+SSR, so run zone.js specs in `jsdom`, `happy-dom` or the browser.
 
 Without `zoneless`, an app is taken to be zoneless when no `node_modules` above
 the Vite root contains `zone.js`. Set `zoneless: true` to keep `async` native in a
