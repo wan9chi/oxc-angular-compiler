@@ -6,7 +6,7 @@
  */
 
 import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { cpus } from 'os'
 
@@ -30,6 +30,16 @@ import {
   FIXTURE_TSCONFIG_PATH,
   ngBaseline,
 } from './ng-baseline.js'
+
+/**
+ * The `rootDirs` Oxc compiles a fixture with, so that `filePath` relative to it is the path
+ * `ngtscFilePath` gives relative to the project root: `/` for `/fixtures/...`, the working
+ * directory for a relative path.
+ */
+function oxcRootDirs(filePath: string): string[] {
+  return [isAbsolute(filePath) ? '/' : process.cwd()]
+}
+
 import type {
   Fixture,
   FixtureResult,
@@ -262,7 +272,7 @@ async function testComponentFixture(fixture: Fixture, verbose?: boolean): Promis
   let oxcOutput: FixtureCompilerOutput
   const oxcStart = performance.now()
   try {
-    const result = compileWithOxcFullFile(source, filePath)
+    const result = compileWithOxcFullFile(source, filePath, { rootDirs: oxcRootDirs(filePath) })
     oxcOutput = {
       code: result.code,
       error: result.error,
@@ -471,7 +481,9 @@ async function testFullTransformFixture(
 
   const oxcStart = performance.now()
   try {
-    const result = compileWithOxcFullFile(fixture.sourceCode, filePath)
+    const result = compileWithOxcFullFile(fixture.sourceCode, filePath, {
+      rootDirs: oxcRootDirs(filePath),
+    })
     oxcOutput = {
       code: result.code,
       error: result.error,
@@ -638,7 +650,7 @@ async function testClassMetadataFixture(
   let oxcOutput: FixtureCompilerOutput
   const oxcStart = performance.now()
   try {
-    const result = compileWithOxcFullFile(fixture.sourceCode, filePath)
+    const result = compileWithOxcFullFile(fixture.sourceCode, filePath, { rootDirs: [compareDir] })
     oxcOutput = {
       code: result.code,
       error: result.error,
