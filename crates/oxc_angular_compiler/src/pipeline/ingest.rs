@@ -4419,7 +4419,8 @@ fn ingest_host_dom_property<'a>(
         name,
         expression,
         unit: property.unit,
-        // Host property bindings recompute the context from the selector.
+        // Host property bindings recompute the context from the selector and
+        // every concrete host (`calcHostBindingSecurityContexts`).
         // `style` / `class` / animation ops are specialized before sanitizers run.
         security_context: match binding_kind {
             BindingKind::Attribute | BindingKind::Property | BindingKind::TwoWayProperty => {
@@ -4440,7 +4441,7 @@ fn ingest_host_dom_property<'a>(
 
 /// Security context for a static host attribute.
 ///
-/// Same selector rules as host property bindings (`calcPossibleSecurityContexts`).
+/// Same rules as host property bindings (`calcHostBindingSecurityContexts`).
 fn compute_security_context(
     selector: &str,
     attr_name: &str,
