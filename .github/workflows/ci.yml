@@ -105,6 +105,15 @@ jobs:
     name: NAPI Build (Ubuntu E2E)
     runs-on: ubuntu-latest
     needs: napi-smoke
+    permissions:
+      contents: read
+      # Remote cache uploads authenticate with a GitHub Actions OIDC token.
+      id-token: write
+    env:
+      # Remote task cache, on when the repository variable is set. Pushes and pull requests from
+      # this repository upload results; fork pull requests get no OIDC token and only download.
+      VP_REMOTE_CACHE_URL: ${{ vars.VP_REMOTE_CACHE_URL }}
+      VP_REMOTE_CACHE: ${{ !vars.VP_REMOTE_CACHE_URL && 'off' || (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'read-write' || 'read' }}
     steps:
       - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
 
@@ -141,5 +150,7 @@ jobs:
         run: |
           pnpm --filter ./napi/angular-compiler exec playwright install --with-deps
           pnpm test:e2e
+      # `vp run compare` runs the harness's `compare --fixtures` in two tasks: the cached ngtsc
+      # baseline, then the comparison with Oxc (see vite.config.ts).
       - name: Compare tests
-        run: pnpm --filter @oxc-angular/compare compare --fixtures
+        run: pnpm exec vp run compare
