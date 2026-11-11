@@ -15,7 +15,7 @@ import { Component } from '@angular/core';
 
 @Component({
   selector: 'app-animate-enter-listener',
-  template: \`<div (animate.enter)="onEnter($event)">Content</div>\`,
+  template: \`<div (animate.enter)="onEnter($event)">Content (verify)</div>\`,
 })
 export class AnimateEnterListenerComponent {
   onEnter(event: unknown) {}
