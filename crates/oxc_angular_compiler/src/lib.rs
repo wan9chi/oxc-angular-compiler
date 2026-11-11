@@ -1,3 +1,4 @@
+// verify: a Rust-only change must not invalidate the ngtsc baseline (temporary)
 //! Angular Template Compiler for Oxc
 //!
 //! This crate provides a Rust port of Angular's template compiler,
