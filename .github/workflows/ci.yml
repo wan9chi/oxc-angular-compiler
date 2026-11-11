@@ -111,7 +111,7 @@ jobs:
       # Fork pull requests never receive one.
       id-token: write
     env:
-      VP_REMOTE_CACHE_URL: https://voidzero-remote-cache.voidzero-docs.workers.dev/projects/oxc-angular-compiler
+      VP_REMOTE_CACHE_URL: https://voidzero-remote-cache.voidzero-docs.workers.dev/projects/oxc-angular-replay
       # Only pushes to main upload. Pull requests only read, which needs no credentials.
       VP_REMOTE_CACHE: ${{ github.event_name == 'push' && 'read-write' || 'read' }}
     steps:

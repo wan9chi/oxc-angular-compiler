@@ -1,3 +1,4 @@
+// verify-nonce: 1794390701
 /**
  * Compiles every fixture with ngtsc and saves the outputs, for `compare --fixtures --ng-baseline`.
  * It loads only the Angular side of the harness, never Oxc or the comparison.
